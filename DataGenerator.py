@@ -13,17 +13,19 @@ from enum import Enum, auto
 ########################################
 # Thresholds and Constants
 ########################################
-VELOCITY_THRESHOLD = 150.0  # Lowered from 200.0 for better sensitivity
-CONSECUTIVE_FRAMES = 4
-DISTANCE_THRESHOLD = 150.0
-TIME_THRESHOLD = 2.0
-YOLO_CONFIDENCE_THRESHOLD = 0.4  # Adjust as needed
+VELOCITY_THRESHOLD = 150.0  # Velocity required to detect a shot
+CONSECUTIVE_FRAMES = 4      # Number of consecutive frames with high velocity
+DISTANCE_THRESHOLD = 150.0   # Distance the ball must move to validate a shot
+TIME_THRESHOLD = 2.0         # Time within which the ball must move after shot initiation
+YOLO_CONFIDENCE_THRESHOLD = 0.4  # YOLO detection confidence threshold
 
-STABLE_FRAMES_REQUIRED = 5
-STABLE_VELOCITY_THRESHOLD = 100  # Lowered from 150 for better stability recognition
-VERTICAL_DISPLACEMENT_THRESHOLD = 50
+STABLE_FRAMES_REQUIRED = 5       # Number of consecutive stable frames required
+STABLE_VELOCITY_THRESHOLD = 80.0 # Maximum velocity during stability check
 
-SMOOTHING_WINDOW = 3  # Number of frames to average for smoothing velocity/acc
+VERTICAL_DISPLACEMENT_THRESHOLD = 50.0  # Minimum upward displacement for shot detection
+BALL_WRIST_DISTANCE_THRESHOLD = 100.0    # Maximum distance between ball and wrist during stability check
+
+SMOOTHING_WINDOW = 3  # Frames to average velocity and acceleration
 
 # Target dimensions for resizing (for pose estimation)
 TARGET_WIDTH = 1280
@@ -36,6 +38,9 @@ SHOT_COOLDOWN_FRAMES = 30  # e.g., 0.5 seconds at 60 FPS
 # Utility Functions
 ########################################
 def calculate_angle(a, b, c):
+    """
+    Calculates the angle at point 'b' formed by points 'a', 'b', and 'c'.
+    """
     a = np.array(a)
     b = np.array(b)
     c = np.array(c)
@@ -47,7 +52,9 @@ def calculate_angle(a, b, c):
     return round(angle, 2)
 
 def process_yolo(frame, model):
-    # Run YOLO inference on the given frame
+    """
+    Runs YOLO inference on the given frame.
+    """
     yolo_results = model(frame)
     return yolo_results
 
@@ -111,6 +118,9 @@ class ShotState(Enum):
     COOLDOWN = auto()
 
 def reset_shot_state():
+    """
+    Resets the shot detection state to initial.
+    """
     return {
         'state': ShotState.WAITING_FOR_STABILITY,
         'stable_frames': 0,
@@ -160,12 +170,12 @@ ANGLE_JOINTS = [
 # Initialize YOLOv5 Model
 ########################################
 try:
-    # Load the YOLOv5 model from the local repository with custom weights
+    # Load the YOLOv5 model from the GitHub repository with custom weights
     model = torch.hub.load(
-        'yolov5',                # Local YOLOv5 directory
-        'custom',                # Model variant
-        path='Weights/best.pt',  # Path to custom weights
-        source='local'           # Load from local repository
+        'ultralytics/yolov5',                # Repository name
+        'custom',                            # Model variant
+        path='Weights/best.pt',              # Path to custom weights
+        source='github'                      # Load from GitHub repository
     )
     model.eval()  # Set model to evaluation mode
     print("YOLOv5 model loaded successfully.")
@@ -454,20 +464,34 @@ for idx, input_video_path in enumerate(input_videos):
                 wrist_abs_y = wrist_pos_y
                 wrist_abs_x = wrist_pos_x
 
+                # Calculate distance between wrist and ball
+                if sports_ball_positions:
+                    ball_x, ball_y = sports_ball_positions[0]
+                    distance = math.sqrt((wrist_pos_x - ball_x) ** 2 + (wrist_pos_y - ball_y) ** 2)
+                    if distance <= BALL_WRIST_DISTANCE_THRESHOLD:
+                        is_ball_close = True
+                        print(f"Frame {frame_count}: Ball is within the valid distance ({BALL_WRIST_DISTANCE_THRESHOLD} units).")
+                    else:
+                        is_ball_close = False
+                        print(f"Frame {frame_count}: Ball is too far from the wrist (Threshold: {BALL_WRIST_DISTANCE_THRESHOLD} units).")
+                else:
+                    is_ball_close = False
+                    print(f"Frame {frame_count}: Ball not detected. Ball-Wrist proximity condition not met.")
+
                 # Debugging: Print current state and key variables
                 print(f"Frame {frame_count}: State={state}, Stable Frames={shot_state['stable_frames']}, Wrist Vel={wrist_vel}, Wrist Abs Y={wrist_abs_y}")
 
                 if state == ShotState.WAITING_FOR_STABILITY:
-                    # Check stability
-                    if wrist_vel is not None and wrist_vel < STABLE_VELOCITY_THRESHOLD:
+                    # Check stability **and** ball proximity
+                    if wrist_vel < STABLE_VELOCITY_THRESHOLD and is_ball_close:
                         shot_state['stable_frames'] += 1
-                        print(f"Frame {frame_count}: Stable frames increased to {shot_state['stable_frames']}")
+                        print(f"Frame {frame_count}: Stable frames increased to {shot_state['stable_frames']} (wrist_vel={wrist_vel}, is_ball_close={is_ball_close})")
                     else:
                         if shot_state['stable_frames'] != 0:
-                            print(f"Frame {frame_count}: Stability lost. Resetting stable_frames.")
+                            print(f"Frame {frame_count}: Stability or ball proximity lost. Resetting stable_frames.")
                         shot_state['stable_frames'] = 0
 
-                    # Transition to READY_TO_DETECT_SHOT if stable
+                    # Transition to READY_TO_DETECT_SHOT if stable and ball is close
                     if shot_state['stable_frames'] >= STABLE_FRAMES_REQUIRED:
                         shot_state['baseline_wrist_y'] = wrist_abs_y
                         shot_state['state'] = ShotState.READY_TO_DETECT_SHOT
@@ -482,12 +506,15 @@ for idx, input_video_path in enumerate(input_videos):
                         print(f"Frame {frame_count}: Appended wrist_vel={wrist_vel} to velocity_history")
                     else:
                         shot_state['velocity_history'].append(0)
+                        print(f"Frame {frame_count}: Appended wrist_vel=0 to velocity_history")
 
                     # Check if enough frames for velocity history
                     if len(shot_state['velocity_history']) == CONSECUTIVE_FRAMES:
                         if all(v > VELOCITY_THRESHOLD for v in shot_state['velocity_history']):
                             # Check upward displacement
-                            if shot_state['baseline_wrist_y'] is not None and (shot_state['baseline_wrist_y'] - wrist_abs_y) > VERTICAL_DISPLACEMENT_THRESHOLD:
+                            displacement = shot_state['baseline_wrist_y'] - wrist_abs_y
+                            print(f"Frame {frame_count}: Displacement={displacement}")
+                            if displacement > VERTICAL_DISPLACEMENT_THRESHOLD:
                                 # Prepare to start a shot
                                 current_shot = {
                                     'start_frame': frame_count,
@@ -559,7 +586,7 @@ for idx, input_video_path in enumerate(input_videos):
                     print(f"Frame {frame_count}: Cooldown counter at {shot_state['cooldown_counter']}")
                     if shot_state['cooldown_counter'] <= 0:
                         shot_state = reset_shot_state()
-                        print(f"Frame {frame_count}: Cooldown complete. Returning to WAITING_FOR_STABILITY.")
+                        print(f"Frame {frame_count}: Cooldown complete. Transitioned to WAITING_FOR_STABILITY.")
 
             else:
                 # No LEFT_WRIST found, possibly reset shot_state or handle accordingly
@@ -612,9 +639,27 @@ for idx, input_video_path in enumerate(input_videos):
             elif shots:
                 last_shot = shots[-1]
                 if last_shot['end_frame'] is not None:
-                    features_row['is_shot'] = 0
-                    features_row['shot_id'] = last_shot['shot_id'] if not last_shot.get('invalid', False) else np.nan
-                    features_row['shot_invalid'] = 1 if last_shot.get('invalid', False) else 0
+                    if not last_shot.get('invalid', False):
+                        shot_info = f"Shot {last_shot['shot_id']} Completed (Duration: {last_shot['duration']:.2f}s)"
+                        cv2.putText(feature_screen, shot_info, (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    else:
+                        shot_info = f"Shot at Frame {last_shot['start_frame']} Invalid"
+                        cv2.putText(feature_screen, shot_info, (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)  # Red for invalid
+                    y_offset += 40
+                else:
+                    # Shot is in progress
+                    if last_shot.get('invalid', False):
+                        shot_info = f"Shot at Frame {last_shot['start_frame']} Invalid"
+                        cv2.putText(feature_screen, shot_info, (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)  # Red for invalid
+                        y_offset += 40
+                    else:
+                        shot_info = f"Shot {last_shot['shot_id']} In Progress"
+                        cv2.putText(feature_screen, shot_info, (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
+                        y_offset += 40
 
             all_data.append(features_row)
             # Draw landmarks on the resized and padded frame
@@ -638,25 +683,37 @@ for idx, input_video_path in enumerate(input_videos):
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
                 y_offset += 40
 
+                # Display distance information
+                if 'distance' in locals():
+                    distance_text = f"Ball-Wrist Dist: {distance:.2f}"
+                    color_dist = (0, 255, 0) if is_ball_close else (0, 0, 255)
+                    cv2.putText(feature_screen, distance_text, (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_dist, 2)
+                    y_offset += 40
+                else:
+                    cv2.putText(feature_screen, "Ball-Wrist Dist: N/A", (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    y_offset += 40
+
                 # Determine condition/state text
                 condition_text = ""
-                color = (255, 255, 255)  # Default white
+                color_state = (255, 255, 255)  # Default white
 
                 if shot_state['state'] == ShotState.WAITING_FOR_STABILITY:
                     condition_text = "Waiting for Stability"
-                    color = (255, 255, 255)  # White
+                    color_state = (255, 255, 255)  # White
                 elif shot_state['state'] == ShotState.READY_TO_DETECT_SHOT:
                     condition_text = "Ready to Detect Shot"
-                    color = (0, 255, 255)  # Cyan
+                    color_state = (0, 255, 255)  # Cyan
                 elif shot_state['state'] == ShotState.SHOT_IN_PROGRESS:
                     condition_text = "Shot In Progress"
-                    color = (0, 255, 255)  # Cyan
+                    color_state = (0, 255, 255)  # Cyan
                 elif shot_state['state'] == ShotState.COOLDOWN:
                     condition_text = "Cooldown Period"
-                    color = (255, 0, 255)  # Magenta
+                    color_state = (255, 0, 255)  # Magenta
 
                 cv2.putText(feature_screen, condition_text, (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_state, 2)
                 y_offset += 40
 
                 # Display shot information if any
@@ -687,6 +744,15 @@ for idx, input_video_path in enumerate(input_videos):
 
                 cv2.putText(feature_screen, f"Frame: {frame_count}", (10, y_offset),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                y_offset += 40
+
+                # Overlay wrist velocity on feature_screen
+                if "LEFT_WRIST" in joint_data:
+                    cv2.putText(feature_screen, f"Wrist Vel: {wrist_vel}", (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+                else:
+                    cv2.putText(feature_screen, "Wrist Vel: N/A", (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
                 y_offset += 40
 
                 # Resize frames for display

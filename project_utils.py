@@ -110,13 +110,15 @@ def extract_roi(frame, landmarks, width, height, padding=50):
 
 import numpy as np
 
+# project_utils.py
+
 def map_to_original(x_padded, y_padded, original_width, original_height, new_width, new_height, left_pad, top_pad):
     """
     Maps coordinates from the resized and padded frame back to the original frame.
 
     Args:
-        x_padded (float): X coordinate in the padded frame.
-        y_padded (float): Y coordinate in the padded frame.
+        x_padded (float): X-coordinate in the padded frame.
+        y_padded (float): Y-coordinate in the padded frame.
         original_width (int): Width of the original frame.
         original_height (int): Height of the original frame.
         new_width (int): Width of the resized frame before padding.
@@ -127,26 +129,21 @@ def map_to_original(x_padded, y_padded, original_width, original_height, new_wid
     Returns:
         tuple: (x_original, y_original) coordinates in the original frame.
     """
-    # Remove padding to get coordinates in the resized frame
-    x_resized = x_padded - left_pad
-    y_resized = y_padded - top_pad
-
-    # Avoid negative coordinates
-    x_resized = max(x_resized, 0)
-    y_resized = max(y_resized, 0)
-
     # Calculate scaling factors
-    scale_x = original_width / new_width
-    scale_y = original_height / new_height
+    scale_x = original_width / new_width if new_width > 0 else 1.0
+    scale_y = original_height / new_height if new_height > 0 else 1.0
 
-    # Map to original frame coordinates
-    x_original = x_resized * scale_x
-    y_original = y_resized * scale_y
+    # Adjust for padding
+    x_unpadded = (x_padded - left_pad) * scale_x
+    y_unpadded = (y_padded - top_pad) * scale_y
 
-    x_original = min(max(x_original, 0), original_width)
-    y_original = min(max(y_original, 0), original_height)   
+    # Clamp values to original frame dimensions
+    x_original = max(0, min(int(x_unpadded), original_width - 1))
+    y_original = max(0, min(int(y_unpadded), original_height - 1))
 
     return x_original, y_original
+
+
 
 
 def reset_detection_history(maxlen=3):

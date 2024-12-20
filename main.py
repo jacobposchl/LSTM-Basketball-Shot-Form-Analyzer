@@ -32,12 +32,38 @@ from config import (
     SHOT_COOLDOWN_FRAMES,
     ShotState,
     YOLO_CONFIDENCE_THRESHOLD,
-    DETECTION_THRESHOLD  # Ensure this is defined in config.py
+    DETECTION_THRESHOLD,
+    USE_WEBCAM  # Imported USE_WEBCAM
 )
 
 from shot_detection import ShotDetector
 from hand_detection import HandDetector  # Ensure this is correctly implemented
 from project_utils import calculate_angle, map_to_original  # Ensure these functions are correctly implemented
+
+# Define MediaPipe Hand Landmarks Mapping
+HAND_LANDMARKS_MAPPING = {
+    0: "wrist",
+    1: "thumb_cmc",
+    2: "thumb_mcp",
+    3: "thumb_ip",
+    4: "thumb_tip",
+    5: "index_finger_mcp",
+    6: "index_finger_pip",
+    7: "index_finger_dip",
+    8: "index_finger_tip",
+    9: "middle_finger_mcp",
+    10: "middle_finger_pip",
+    11: "middle_finger_dip",
+    12: "middle_finger_tip",
+    13: "ring_finger_mcp",
+    14: "ring_finger_pip",
+    15: "ring_finger_dip",
+    16: "ring_finger_tip",
+    17: "pinky_mcp",
+    18: "pinky_pip",
+    19: "pinky_dip",
+    20: "pinky_tip"
+}
 
 # Initialize logging
 LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
@@ -149,10 +175,7 @@ def main():
     shot_detector = ShotDetector()
 
     # Initialize HandDetector if detect_hands is True
-    if shot_detector.detect_hands:
-        hand_detector = HandDetector()
-    else:
-        hand_detector = None
+    hand_detector = HandDetector()
 
     # Initialize MediaPipe Pose
     import mediapipe as mp
@@ -171,7 +194,7 @@ def main():
         model = torch.hub.load(
             'ultralytics/yolov5',                # Repository name
             'custom',                            # Model variant
-            path='Weights/best.pt',              # Path to custom weights (from config.py)
+            path=config.YOLO_WEIGHTS_PATH,       # Path to custom weights (from config.py)
             source='github'                      # Load from GitHub repository
         )
         model.eval()  # Set model to evaluation mode
@@ -199,17 +222,28 @@ def main():
     
     logger.info(f"Ball Class ID: {SPORTS_BALL_CLASS_ID}")
 
-    # Process each video
-    for idx, input_video_path in enumerate(INPUT_VIDEOS):
-        logger.info(f"\nProcessing video {idx+1}/{len(INPUT_VIDEOS)}: {input_video_path}")
+    # Initialize Hand Data List
+    hand_data_all_videos = []
 
-        if not os.path.isfile(input_video_path):
-            logger.error(f"Video file does not exist: {input_video_path}")
-            continue
+    # Process each video or webcam
+    for idx, input_video_source in enumerate(INPUT_VIDEOS):
+        if config.USE_WEBCAM:
+            logger.info(f"\nAccessing webcam {input_video_source} for video {idx+1}/{len(INPUT_VIDEOS)}")
+            cap = cv2.VideoCapture(int(input_video_source))  # Ensure it's an integer for webcam
+        else:
+            logger.info(f"\nProcessing video {idx+1}/{len(INPUT_VIDEOS)}: {input_video_source}")
 
-        cap = cv2.VideoCapture(input_video_path)
+            if not os.path.isfile(input_video_source):
+                logger.error(f"Video file does not exist: {input_video_source}")
+                continue
+
+            cap = cv2.VideoCapture(input_video_source)
+
         if not cap.isOpened():
-            logger.error(f"Could not open video file: {input_video_path}")
+            if config.USE_WEBCAM:
+                logger.error(f"Could not access webcam {input_video_source}.")
+            else:
+                logger.error(f"Could not open video file: {input_video_source}")
             continue
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -219,7 +253,7 @@ def main():
         original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         logger.info(f"Original Video Properties - FPS: {fps}, Width: {original_width}, Height: {original_height}")
-        logger.info(f"Resizing all frames to {TARGET_WIDTH}x{TARGET_HEIGHT} for pose estimation.")
+        logger.info(f"Resizing all frames to {config.TARGET_WIDTH}x{config.TARGET_HEIGHT} for pose estimation.")
 
         prev_positions = {}
         prev_velocities = {}
@@ -233,15 +267,15 @@ def main():
         logger.info("Initialized shot_num to 0")
 
         # Initialize smoothing windows
-        joint_vel_history = {joint_name: deque(maxlen=SMOOTHING_WINDOW) for joint_name in joint_map.keys()}
-        joint_acc_history = {joint_name: deque(maxlen=SMOOTHING_WINDOW) for joint_name in joint_map.keys()}
+        joint_vel_history = {joint_name: deque(maxlen=config.SMOOTHING_WINDOW) for joint_name in joint_map.keys()}
+        joint_acc_history = {joint_name: deque(maxlen=config.SMOOTHING_WINDOW) for joint_name in joint_map.keys()}
 
         # Initialize detection history deque for temporal smoothing
-        detection_history = deque(maxlen=DETECTION_THRESHOLD)
+        detection_history = deque(maxlen=config.DETECTION_THRESHOLD)
 
-        # Initialize visualization windows for the first few videos
-        if idx < 5:
-            cv2.namedWindow("Detection", cv2.WINDOW_NORMAL)
+        # Initialize visualization windows for the first few videos or webcam
+        if idx < 5 or config.USE_WEBCAM:
+            cv2.namedWindow("Detection with Orientation Vectors", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Visualization", cv2.WINDOW_NORMAL)
         else:
             logger.info("Skipping visualization for videos beyond the first 5.")
@@ -251,7 +285,10 @@ def main():
         while True:
             ret, frame = cap.read()
             if not ret:
-                logger.info("End of video file reached.")
+                if config.USE_WEBCAM:
+                    logger.info("Webcam stream ended or disconnected.")
+                else:
+                    logger.info("End of video file reached.")
                 break
 
             frame_count += 1
@@ -261,23 +298,23 @@ def main():
 
             # Resize frame to target resolution while preserving aspect ratio
             aspect_ratio = original_width / original_height
-            target_aspect_ratio = TARGET_WIDTH / TARGET_HEIGHT
+            target_aspect_ratio = config.TARGET_WIDTH / config.TARGET_HEIGHT
 
             if aspect_ratio > target_aspect_ratio:
                 # Fit to width
-                new_width = TARGET_WIDTH
-                new_height = int(TARGET_WIDTH / aspect_ratio)
+                new_width = config.TARGET_WIDTH
+                new_height = int(config.TARGET_WIDTH / aspect_ratio)
             else:
                 # Fit to height
-                new_height = TARGET_HEIGHT
-                new_width = int(TARGET_HEIGHT * aspect_ratio)
+                new_height = config.TARGET_HEIGHT
+                new_width = int(config.TARGET_HEIGHT * aspect_ratio)
 
             # Resize while maintaining aspect ratio
             frame_resized = cv2.resize(frame, (new_width, new_height))
 
             # Add padding to reach TARGET_WIDTH x TARGET_HEIGHT
-            delta_w = TARGET_WIDTH - new_width
-            delta_h = TARGET_HEIGHT - new_height
+            delta_w = config.TARGET_WIDTH - new_width
+            delta_h = config.TARGET_HEIGHT - new_height
             top_pad, bottom_pad = delta_h // 2, delta_h - (delta_h // 2)
             left_pad, right_pad = delta_w // 2, delta_w - (delta_w // 2)
 
@@ -291,7 +328,12 @@ def main():
             results_pose = pose.process(rgb_frame)
 
             # Run YOLO on the original frame
-            yolo_results = model(original_frame)
+            try:
+                yolo_results = model(original_frame)
+            except Exception as e:
+                logger.error(f"Error running YOLO model on frame {frame_count}: {e}")
+                yolo_results = None
+
             filtered_detections = []
 
             if yolo_results and hasattr(yolo_results, 'xyxy') and len(yolo_results.xyxy) > 0:
@@ -332,6 +374,8 @@ def main():
             skeleton_center_x = None
             skeleton_center_y = None
 
+            normalized_hip_center_y = None  # Initialize normalized hip_center_y
+
             if results_pose and results_pose.pose_landmarks:
                 landmarks = results_pose.pose_landmarks.landmark
                 left_hip = landmarks[joint_map["LEFT_HIP"]]
@@ -339,20 +383,28 @@ def main():
 
                 if left_hip.visibility > 0.5 and right_hip.visibility > 0.5:
                     # Calculate the center of the hips in the padded frame
-                    skeleton_center_padded_x = ((left_hip.x + right_hip.x) / 2) * TARGET_WIDTH
-                    skeleton_center_padded_y = ((left_hip.y + right_hip.y) / 2) * TARGET_HEIGHT
+                    skeleton_center_padded_x = ((left_hip.x + right_hip.x) / 2) * config.TARGET_WIDTH
+                    skeleton_center_padded_y = ((left_hip.y + right_hip.y) / 2) * config.TARGET_HEIGHT
 
                     # Map the skeleton center back to the original frame
                     skeleton_center_original_x, skeleton_center_original_y = map_to_original(
                         skeleton_center_padded_x, skeleton_center_padded_y,
-                        original_width, original_height,
-                        new_width, new_height,
-                        left_pad, top_pad
+                        original_width=int(original_frame.shape[1]),
+                        original_height=int(original_frame.shape[0]),
+                        new_width=new_width,
+                        new_height=new_height,
+                        left_pad=left_pad,
+                        top_pad=top_pad
                     )
 
                     skeleton_center_x = skeleton_center_original_x
                     skeleton_center_y = skeleton_center_original_y
                     frames_with_landmarks += 1
+
+                    # Normalize hip_center_y
+                    normalized_hip_center_y = skeleton_center_y / original_height  # Range [0.0, 1.0]
+                    # Clamp the value to [0.0, 1.0] to handle any anomalies
+                    normalized_hip_center_y = max(0.0, min(1.0, normalized_hip_center_y))
                 else:
                     logger.warning(f"Frame {frame_count}: Hips not sufficiently visible.")
             else:
@@ -363,8 +415,8 @@ def main():
                 for joint_name, joint_idx in joint_map.items():
                     j_lm = landmarks[joint_idx]
                     # Scale normalized landmark to actual pixel coordinates on padded frame
-                    x_padded = j_lm.x * TARGET_WIDTH
-                    y_padded = j_lm.y * TARGET_HEIGHT
+                    x_padded = j_lm.x * config.TARGET_WIDTH
+                    y_padded = j_lm.y * config.TARGET_HEIGHT
 
                     # Map to original frame coordinates
                     x_original, y_original = map_to_original(
@@ -422,7 +474,7 @@ def main():
                     prev_velocities[joint_name] = raw_velocity
 
             features_row = {
-                'video': os.path.basename(input_video_path),
+                'video': os.path.basename(input_video_source) if not config.USE_WEBCAM else 'Webcam',
                 'frame': frame_count,
                 'label': LABEL
             }
@@ -442,8 +494,7 @@ def main():
             # Shot Detection Logic
             if "LEFT_WRIST" in joint_data:
                 wrist_vel = joint_data["LEFT_WRIST"]["vel"]
-                wrist_pos = joint_data["LEFT_WRIST"]["pos"]  # Relative position
-                wrist_abs_y = wrist_pos[1]
+                wrist_abs_y = joint_data["LEFT_WRIST"]["pos"][1]
                 # Ball position (relative)
                 ball_pos = (
                     sports_ball_positions[0][0] - skeleton_center_x,
@@ -454,7 +505,7 @@ def main():
                 shot_detector.update(
                     wrist_vel=wrist_vel,
                     wrist_abs_y=wrist_abs_y,
-                    wrist_pos=wrist_pos,
+                    wrist_pos=joint_data["LEFT_WRIST"]["pos"],
                     ball_pos=ball_pos,
                     fps=fps,
                     frame_count=frame_count
@@ -499,15 +550,14 @@ def main():
                     features_row[f"{joint_b}_{joint_a}_{joint_c}_angle"] = np.nan
 
             # Update features_row with shot information
-            features_row['is_shot'] = 0
+            features_row['is_shot'] = 0 # 0: Not a shot, 1: Shot
             features_row['shot_id'] = np.nan
             features_row['shot_invalid'] = 0  # 0: valid, 1: invalid
 
             # Initialize thumbs_up_count
             thumbs_up_count = 0
-
             # Thumbs-Up Detection Logic
-            if shot_detector.detect_hands and idx < 5:  # Only for the first 5 videos and if hand detection is enabled
+            if shot_detector.detect_hands:  # Only for the first 5 videos and if hand detection is enabled
                 if "LEFT_WRIST" in joint_data and "RIGHT_WRIST" in joint_data:
                     # Process both wrists for thumbs-up
                     left_wrist_rel_pos = joint_data["LEFT_WRIST"]["pos"]
@@ -519,20 +569,22 @@ def main():
 
                     # Define ROIs around both wrists using absolute positions
                     if left_wrist_abs_pos[0] is not None and left_wrist_abs_pos[1] is not None:
-                        draw_wrist_roi(original_frame, left_wrist_abs_pos[0], left_wrist_abs_pos[1], 150, (255, 0, 0), "Left Wrist")
+                        draw_wrist_roi(original_frame, left_wrist_abs_pos[0], left_wrist_abs_pos[1], config.ROI_SIZE, (255, 0, 0), "Left Wrist")
                     if right_wrist_abs_pos[0] is not None and right_wrist_abs_pos[1] is not None:
-                        draw_wrist_roi(original_frame, right_wrist_abs_pos[0], right_wrist_abs_pos[1], 150, (0, 255, 0), "Right Wrist")
+                        draw_wrist_roi(original_frame, right_wrist_abs_pos[0], right_wrist_abs_pos[1], config.ROI_SIZE, (0, 255, 0), "Right Wrist")
 
                     # Process hands within ROIs
                     hands_detected = 0
                     thumbs_up_count = 0
+
+                    # Clear previous features before processing new hands
+                    hand_detector.clear_features()
 
                     for roi_pos, label in [((left_wrist_abs_pos[0], left_wrist_abs_pos[1]), "Left"), 
                                            ((right_wrist_abs_pos[0], right_wrist_abs_pos[1]), "Right")]:
                         x_center, y_center = roi_pos
                         if x_center is None or y_center is None:
                             continue  # Skip if wrist position is not available
-
                         x_min = max(int(x_center - 75), 0)
                         y_min = max(int(y_center - 75), 0)
                         x_max = min(int(x_center + 75), original_width)
@@ -550,65 +602,50 @@ def main():
                             continue
 
                         roi_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
-
                         # Process the ROI with HandDetector only if ShotState = Waiting for Thumbs-Up
-                        if shot_detector.detect_hands and hand_detector:
+                        if hand_detector:
                             hand_results = hand_detector.process_frame(roi_rgb)
-
                             if hand_results and hand_results.multi_hand_landmarks and hand_results.multi_handedness:
+                                
+                                # Draw landmarks and orientation vectors
+                                hand_detector.draw_landmarks(original_frame, hand_results.multi_hand_landmarks, hand_results.multi_handedness, draw_orientation_vectors=True)
+                                
                                 for hand_landmarks, hand_handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
                                     hands_detected += 1
                                     handedness_label = hand_handedness.classification[0].label  # 'Left' or 'Right'
 
-                                    # *** Begin: Mapping and Drawing Landmarks ***
-                                    # Convert normalized landmarks to ROI pixel coordinates
-                                    landmarks_pixel = []
-                                    for lm in hand_landmarks.landmark:
-                                        x = int(lm.x * 150) + x_min  # ROI size is 150
-                                        y = int(lm.y * 150) + y_min
-                                        landmarks_pixel.append((x, y))
-
-                                    # Draw connections
-                                    for connection in mp.solutions.hands.HAND_CONNECTIONS:
-                                        start_idx, end_idx = connection
-                                        start_point = landmarks_pixel[start_idx]
-                                        end_point = landmarks_pixel[end_idx]
-                                        cv2.line(original_frame, start_point, end_point, (0, 255, 0), 2)
-
-                                    # Draw landmarks
-                                    for point in landmarks_pixel:
-                                        cv2.circle(original_frame, point, 2, (0, 0, 255), -1)
-
-                                    # Optionally, add text for handedness
-                                    cv2.putText(original_frame, handedness_label, (x_min, y_max + 30),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
-                                    # *** End: Mapping and Drawing Landmarks ***
-
-                                    # Determine if the hand is upright
-                                    if not hand_detector.is_hand_upright(hand_landmarks):
-                                        continue  # Skip if hand is not upright
-
                                     # Determine if the hand is showing thumbs-up
-                                    # Adjust the y-coordinate reference for relative positions
-                                    hip_y_relative = 0  # Since positions are relative to hip center
-                                    if hand_detector.is_thumbs_up(hand_landmarks, handedness_label, hip_y_relative):
-                                        thumbs_up_count += 1
-                                        # Annotate thumbs-up on the display frame
-                                        cv2.putText(original_frame, f"Thumbs Up ({label})", 
-                                                    (x_min, y_min - 10),
-                                                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
-                                        logger.info(f"Frame {frame_count}: Thumbs Up detected on {label} hand.")
-                                    else:
-                                        logger.info(f"Frame {frame_count}: No thumbs up on {label} hand.")
-                if shot_detector.detect_hands and idx < 5:
-                    # Update detection history
+                                    is_up = hand_detector.is_thumbs_up(hand_landmarks, handedness_label)
+                                    if is_up:
+                                        thumbs_up_count += 1  # Increment thumbs-up count
+
+                                    # Collect hand data for CSV
+                                    hand_data = {
+                                        'video': os.path.basename(input_video_source) if not config.USE_WEBCAM else 'Webcam',
+                                        'frame': frame_count,
+                                        'hand_id': hands_detected,  # Assuming sequential IDs per frame
+                                        'handedness': handedness_label,
+                                        'is_thumbs_up': is_up  # Optional: Include gesture information
+                                    }
+
+                                    # Extract and store all landmark positions with specific joint names
+                                    for idx_lm, lm in enumerate(hand_landmarks.landmark):
+                                        joint_name = HAND_LANDMARKS_MAPPING.get(idx_lm, f"landmark_{idx_lm}")
+                                        hand_data[f'{joint_name}_x'] = round(lm.x, 4)
+                                        hand_data[f'{joint_name}_y'] = round(lm.y, 4)
+                                        hand_data[f'{joint_name}_z'] = round(lm.z, 4)
+
+                                    hand_data_all_videos.append(hand_data)
+
+                # Update detection history
+                if shot_detector.detect_hands:
                     if thumbs_up_count == 2 and hands_detected == 2:
                         detection_history.append(1)
                     else:
                         detection_history.append(0)
 
                     # Determine thumbs-up status based on detection history
-                    if sum(detection_history) >= DETECTION_THRESHOLD:
+                    if sum(detection_history) >= config.DETECTION_THRESHOLD:
                         # Display confirmation message
                         thumbs_up_status = "Both Thumbs Up!"
                         # Reset history after detection
@@ -617,6 +654,7 @@ def main():
                         thumbs_up_status = f"{thumbs_up_count} Hand(s) Showing Thumbs Up"
                     else:
                         thumbs_up_status = "No Thumbs Up Detected"
+
 
             # Add the current features_row to all_data
             all_data.append(features_row)
@@ -634,7 +672,7 @@ def main():
                 )
 
             # Simplified Feature Visualization
-            feature_screen = np.zeros((400, 600, 3), dtype=np.uint8)
+            feature_screen = np.zeros((600, 600, 3), dtype=np.uint8)  # Increased height to accommodate more features
             y_offset = 30
 
             # Current Shot ID
@@ -668,6 +706,25 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
 
+            # Hip Center Y Visualization
+            if normalized_hip_center_y is not None:
+                hip_center_y_text = f"Hip Center Y: {normalized_hip_center_y:.2f} (Normalized)"
+            else:
+                hip_center_y_text = "Hip Center Y: N/A"
+            cv2.putText(feature_screen, hip_center_y_text, (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            y_offset += 40
+
+            # Retrieve and display latest hand features
+            if hand_detector:
+                latest_features = hand_detector.get_latest_features()
+                for feature in latest_features:
+                    if 'thumb_is_above' in feature and feature['thumb_is_above'] is not None:
+                        status = "Yes" if feature['thumb_is_above'] else "No"
+                        cv2.putText(feature_screen, f"Thumb Above Fingers: {status}", (10, y_offset),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2)
+                        y_offset += 30
+
             # Distance between Ball and Wrist
             if "LEFT_WRIST" in joint_data and sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None:
                 distance = shot_detector.distance  # Assuming shot_detector calculates this
@@ -680,7 +737,7 @@ def main():
             y_offset += 40
 
             # Thumbs Up Count
-            if shot_detector.detect_hands and idx < 5:
+            if shot_detector.detect_hands:
                 if thumbs_up_count == 2:
                     color_thumbs = (0, 255, 0)  # Green
                 elif thumbs_up_count == 1:
@@ -702,14 +759,14 @@ def main():
             y_offset += 40
 
             # Visualization
-            if idx < 5:
+            if idx < 5 or config.USE_WEBCAM:
                 # Resize frame for display
-                resized_detection_display = cv2.resize(original_frame, (TARGET_WIDTH // 2, TARGET_HEIGHT // 2))
-                cv2.imshow("Detection", resized_detection_display)
+                resized_detection_display = cv2.resize(original_frame, (config.TARGET_WIDTH // 2, config.TARGET_HEIGHT // 2))
+                cv2.imshow("Detection with Orientation Vectors", resized_detection_display)
 
                 # Display Feature Visualization
                 cv2.imshow("Feature Visualization", feature_screen)
-            elif idx >= 5:
+            else:
                 # Display Feature Visualization
                 cv2.imshow("Feature Visualization", feature_screen)
 
@@ -717,27 +774,30 @@ def main():
             if frame_count % 100 == 0:
                 logger.info(f"Processed {frame_count} frames, {frames_with_landmarks} with landmarks detected.")
 
-            # Allow exit on 'q' key press for the first 5 videos
-            if idx < 5:
-                key = cv2.waitKey(1) & 0xFF
-                if key == ord('q'):
-                    logger.info("Exiting processing loop as 'q' was pressed.")
-                    break
+            # Allow exit on 'q' key press for the first 5 videos or webcam
+            key = cv2.waitKey(1) & 0xFF
+            if key == ord('q'):
+                logger.info("Exiting processing loop as 'q' was pressed.")
+                break
 
         # After exiting the loop
         cap.release()
-        if idx < 5:
+        if idx < 5 or config.USE_WEBCAM:
             cv2.destroyAllWindows()
             cv2.waitKey(1)  # Ensure all windows are closed properly
 
-        logger.info(f"Finished processing video: {input_video_path}")
+        logger.info(f"Finished processing video: {input_video_source}")
 
         # Data Engineering: Save the entire dataset for the current video
         df = pd.DataFrame(all_data)
         df.replace("N/A", np.nan, inplace=True)
         df.fillna(0, inplace=True)
 
-        output_csv_filename = os.path.splitext(os.path.basename(input_video_path))[0] + "_entire_dataset.csv"
+        if not config.USE_WEBCAM:
+            output_csv_filename = os.path.splitext(os.path.basename(input_video_source))[0] + "_entire_dataset.csv"
+        else:
+            output_csv_filename = "Webcam_entire_dataset.csv"
+
         output_csv_path = os.path.join(DATASETS_DIR, output_csv_filename)
         df.to_csv(output_csv_path, index=False)
         logger.info(f"Complete dataset successfully saved to {output_csv_path}")
@@ -766,17 +826,34 @@ def main():
                                 shot_df = shot_df.drop(columns=columns_to_drop, errors='ignore')
                                 shot_df = shot_df.reset_index(drop=True)
 
-                                output_csv_filename = os.path.splitext(os.path.basename(input_video_path))[0] + f"_shot_{s_id}.csv"
-                                output_csv_path = os.path.join(DATASETS_DIR, output_csv_filename)
+                                if not config.USE_WEBCAM:
+                                    output_csv_filename_shot = os.path.splitext(os.path.basename(input_video_source))[0] + f"_shot_{s_id}.csv"
+                                else:
+                                    output_csv_filename_shot = f"Webcam_shot_{s_id}.csv"
 
-                                shot_df.to_csv(output_csv_path, index=False)
-                                logger.info(f"Feature data for shot {s_id} successfully saved to {output_csv_path}")
+                                output_csv_path_shot = os.path.join(DATASETS_DIR, output_csv_filename_shot)
+
+                                shot_df.to_csv(output_csv_path_shot, index=False)
+                                logger.info(f"Feature data for shot {s_id} successfully saved to {output_csv_path_shot}")
                     else:
                         logger.warning(f"No valid shot data found for shot_id {s_id}. No dataset saved.")
             else:
-                logger.warning(f"No valid shots found in {input_video_path}")
+                logger.warning(f"No valid shots found in {input_video_source}")
         else:
-            logger.warning(f"No shots detected or 'shot_id' column missing in {input_video_path}")
+            logger.warning(f"No shots detected or 'shot_id' column missing in {input_video_source}")
+
+    # After processing all videos/webcam, save hand data
+    if hand_data_all_videos:
+        df_hands = pd.DataFrame(hand_data_all_videos)
+        if not config.USE_WEBCAM:
+            hands_csv_filename = os.path.splitext(os.path.basename(INPUT_VIDEOS[0]))[0] + "_hands.csv"
+        else:
+            hands_csv_filename = "Webcam_hands.csv"
+        hands_csv_path = os.path.join(DATASETS_DIR, hands_csv_filename)
+        df_hands.to_csv(hands_csv_path, index=False)
+        logger.info(f"Hand data successfully saved to {hands_csv_path}")
+    else:
+        logger.info("No hand data to save.")
 
     # Cleanup after all videos are processed
     pose.close()

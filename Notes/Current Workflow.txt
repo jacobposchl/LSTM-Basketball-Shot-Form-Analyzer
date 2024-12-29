@@ -1,0 +1,16 @@
+Current Workflow:
+
+Changes to files:
+	-upload changes to git
+		-Move large directories and files to GCP Bucket manually
+		-use git add . (or files changed) -> git commit -m "text" -> git push
+
+	-upload changes to GCP VM from Git
+		-cd /basketball-ai-data/project/basketball-ai-data/files/
+		(IF NOT CLONED)
+		-git clone https://github.com/jacobposchl/LSTM-Basketball-Form-Analyzer.git
+		(ELSE)
+		-git pull origin main
+		-(IF REQIUREMENTS NOT DOWNLOADED)
+		-pip install requirements.txt
+	

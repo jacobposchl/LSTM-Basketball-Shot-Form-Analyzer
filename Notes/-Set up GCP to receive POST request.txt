@@ -1,0 +1,14 @@
+-Set up GCP to receive POST requests, as Input Videos
+-Save the input videos and immediately trigger the main.py file for preprocessing
+-Send results of preprocessing to the mobile app via a GET request (requested from the mobile app)
+
+
+Temp:
+-Changes to files workflow -> CurentWorkflow.txt
+-Run main.py on VM -> ensure it works
+-Ensure code uses GCP Bucket on VS Code and automatically syncs and updates Bucket (has access to GCP Bucket from local machine)
+-Remove all instances of using webcam
+-Clean Code
+-Work on fixes
+
+

@@ -1,0 +1,36 @@
+Right Now:
+
+	Fixes:
+		-YOLO weights finish (run this in the terminal):
+		python train.py --data direct1/data.yaml --resume runs/train/exp24/weights/last.pt
+
+
+		-remove uneccesary features (ex: nose)
+
+TO - DO:
+
+-Data Engineering:
+-Visualize Data
+	-graphs to compare features and frames
+	-any direct visual correlations??? (between good vs bad)
+		-ex. wrist_vel at frame 40 is higher significantly for good shots while at bad shots it is really low
+
+-Setup the model (LSTM architecture)
+	-Start with basic, see how accuracy performs with amount of data used ****BIG STEP
+		-(make sure model.add(Masking() is added before model.add(LSTM())))
+	-Do more research on LSTM models and tensorflow
+	-Upgrade model, see how it performs compared to previous, basic model
+
+-Convert outputs of model to useful insights for users
+	-Converting model output to text user can understand
+	-Visualization of differences in your form vs your "good form"
+
+EXTRAS:
+-3d angles?? allow use of different angled vidoes
+	-redo all frame calls in code make sure accurate in dataset
+-Add important features to outputted dataset
+	-Wrist/Hand/Finger Position/Vel
+	-Distance between all joints (instead of polynomial feature extraction)
+-Better Hand Skeleton Detection
+-Parallel computing
+	-compute multiple frames at the same time? 

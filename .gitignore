@@ -1,0 +1,5 @@
+# Exclude large directories
+/Datasets/
+/Weights/
+/Videos/
+/yolov5/

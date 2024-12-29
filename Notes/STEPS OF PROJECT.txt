@@ -1,0 +1,28 @@
+STEPS OF PROJECT:
+
+tracking the form of a basketball jumpshot
+mediapipe -> skeleton of the player's jumpshot
+implement into a dataframe
+columns:
+-joint position
+-joint angle
+-joint velocity
+-joint accel
+-frame
+-position of ball
+-target feature -> good / bad 
+row:
+-time
+
+preprocess
+-hot encoded
+-normalize data to same metric
+-normalize positional data to center of player, solves issue of generalization across different angles of videos.
+
+additional features:
+-has this joint moved significantly in the last n seconds
+-is the ball still in the players hand
+
+find leading factors that decide if jumpshot is good or bad
+
+give insights to user to determine how to improve their jumpshot

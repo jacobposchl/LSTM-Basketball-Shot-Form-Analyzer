@@ -82,10 +82,8 @@ class HandDetector:
                             color = (0, 0, 225)  # Red for Left Hand
                         else:
                             color = (225, 0, 0)    # Blue for Right Hand
-                        self.logger.debug(f"Drawing {hand_label} hand with color {color}")
                     else:
                         color = (121, 22, 76)  # Purple as default color
-                        self.logger.debug(f"Drawing hand with default color {color}")
                     
                     # Draw landmarks
                     self.mp_drawing.draw_landmarks(
@@ -260,17 +258,14 @@ class HandDetector:
                 thumb_tip.y + thumb_threshold < pinky_tip.y
             )
 
-            #self.logger.debug(f"Thumb is above other fingers: {thumb_is_above} : {handedness}")
 
             # 2. Check if other fingers are curled
             fingers = ['INDEX', 'MIDDLE', 'RING', 'PINKY']
             fingers_curled = all([self.is_finger_curled(hand_landmarks, finger) for finger in fingers])
 
-            #self.logger.debug(f"All other fingers curled: {fingers_curled}")
 
             # 3. Combine both conditions
             if thumb_is_above and fingers_curled:
-                self.logger.debug("Thumbs-up gesture detected.")
                 return True
             else:
                 return False
@@ -326,17 +321,14 @@ class HandDetector:
                 thumb_tip.y - thumb_threshold > pinky_tip.y
             )
 
-            #self.logger.debug(f"Thumb is below other fingers: {thumb_is_below} : {handedness}")
 
             # 2. Check if other fingers are curled
             fingers = ['INDEX', 'MIDDLE', 'RING', 'PINKY']
             fingers_curled = all([self.is_finger_curled(hand_landmarks, finger) for finger in fingers])
 
-            #self.logger.debug(f"All other fingers curled: {fingers_curled}")
 
             # 3. Combine both conditions
             if thumb_is_below and fingers_curled:
-                self.logger.debug("Thumbs-down gesture detected.")
                 return True
             else:
                 return False

@@ -5,6 +5,23 @@ from enum import Enum, auto
 
 
 # ===================================
+# Development Mode Configuration
+# ===================================
+
+DEV_MODE = True  # Set to True for development mode with visualizations and specific video files
+
+# List of specific video filenames to process when DEV_MODE is True
+DEV_VIDEOS = [
+    "long_vid.mov"
+]
+"""
+Available videos:
+- latest_vid.MOV
+- long_vid.mov
+"""
+
+
+# ===================================
 # GCP Configuration
 # ===================================
 
@@ -16,10 +33,14 @@ GCP_DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GCP
 os.makedirs(GCP_DOWNLOAD_DIR, exist_ok=True)
 
 # YOLO Weights Path (ensure this points to the correct location on the VM)
-YOLO_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Weights', 'old_best_v1.pt')
-
-
-
+YOLO_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Weights', 'old_best_v2.pt')
+"""
+Available weights:
+- old_best.pt
+- old_best_v1.pt
+- old_best_v2.pt
+- best.pt
+"""
 
 # ===================================
 # Thresholds and Constants
@@ -87,24 +108,15 @@ os.makedirs(YOLOV5_DIR, exist_ok=True)
 # Input Videos and Labels Configuration
 # ===================================
 
-# Webcam Configuration
-USE_WEBCAM = False  # Set to True to use the webcam instead of input videos
+# Since webcam is no longer used, remove all webcam configurations.
+# INPUT_VIDEOS will be managed based on DEV_MODE and DEV_VIDEOS.
 
-if USE_WEBCAM:
-    INPUT_VIDEOS = [0]  # 0 is the default webcam index. Change if you have multiple webcams.
-else:
-    INPUT_VIDEOS = []  # Add more video paths as needed
-    #thumbs_up.mov <- Thumbs Up Video
-    #long_vid_final.mov <- Long Video trimmed
-    #new_long_vid2 <- new long video (trimmed)
-    #thumbs_up_2.mov <- Thumbs Up Video 2
-    #thumbs_up_1.mov <- Thumbs Up Video 1
-
+INPUT_VIDEOS = []  # This will be populated dynamically based on DEV_MODE
 
 # YOLO Weights Path
 YOLO_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, 'old_best_v1.pt')
-#Best currently -> old_best_v1
-#Currently training -> best
+# Best currently -> old_best_v1
+# Currently training -> best
 
 # ===================================
 # MediaPipe Pose Configuration

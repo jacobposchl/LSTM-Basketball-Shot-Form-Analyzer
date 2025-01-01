@@ -60,11 +60,7 @@ class ShotDetector:
         Returns:
             None
         """
-        # Log the current state and relevant parameters for debugging
-        self.logger.debug(
-            f"Frame {frame_count}: State={self.state}, Stable Frames={self.stable_frames}, "
-            f"Wrist Vel={wrist_vel}, Wrist Abs Y={wrist_abs_y}"
-        )
+
 
         # Calculate the Euclidean distance between the wrist and the ball
         self.distance = self.calculate_distance(wrist_pos, ball_pos)
@@ -84,14 +80,8 @@ class ShotDetector:
             # Check if wrist velocity is below the stable threshold and the ball is close
             if wrist_vel is not None and wrist_vel < STABLE_VELOCITY_THRESHOLD and self.is_ball_close:
                 self.stable_frames += 1  # Increment stable frame counter
-                self.logger.debug(
-                    f"Stable frames increased to {self.stable_frames} "
-                    f"(wrist_vel={wrist_vel}, is_ball_close={self.is_ball_close})"
-                )
             else:
                 # If stability or ball proximity is lost, reset the stable frame counter
-                if self.stable_frames != 0:
-                    self.logger.debug("Stability or ball proximity lost. Resetting stable_frames.")
                 self.stable_frames = 0
 
             # If enough stable frames are detected, transition to READY_TO_DETECT_SHOT state
@@ -99,17 +89,13 @@ class ShotDetector:
                 self.baseline_wrist_y = wrist_abs_y  # Set baseline Y-coordinate for displacement
                 self.state = ShotState.READY_TO_DETECT_SHOT  # Transition state
                 self.velocity_history.clear()  # Clear velocity history for new detection
-                self.logger.info(f"Baseline wrist Y set at {self.baseline_wrist_y}")
-                self.logger.info("Transitioned to READY_TO_DETECT_SHOT")
 
         elif self.state == ShotState.READY_TO_DETECT_SHOT:
             # Append current wrist velocity to the history, using 0 if velocity is None
             if wrist_vel is not None:
                 self.velocity_history.append(wrist_vel)
-                self.logger.debug(f"Appended wrist_vel={wrist_vel} to velocity_history")
             else:
                 self.velocity_history.append(0)
-                self.logger.debug("Appended wrist_vel=0 to velocity_history")
 
             # Check if enough velocity data has been collected
             if len(self.velocity_history) == CONSECUTIVE_FRAMES:
@@ -117,7 +103,6 @@ class ShotDetector:
                 if all(v > VELOCITY_THRESHOLD for v in self.velocity_history):
                     # Calculate vertical displacement from baseline
                     displacement = self.baseline_wrist_y - wrist_abs_y
-                    self.logger.debug(f"Displacement={displacement}")
 
                     # If displacement exceeds threshold, a shot is detected
                     if displacement > VERTICAL_DISPLACEMENT_THRESHOLD:
@@ -133,12 +118,7 @@ class ShotDetector:
                         }
                         self.state = ShotState.SHOT_IN_PROGRESS  # Transition to SHOT_IN_PROGRESS state
                         self.velocity_history.clear()  # Clear velocity history for next detection
-                        self.logger.info(f"Shot {self.shot_num} detected. Transitioned to SHOT_IN_PROGRESS.")
                     else:
-                        # If displacement is insufficient, do not count as shot
-                        self.logger.debug(
-                            "High velocity detected but no upward displacement. Not counting as shot start."
-                        )
                         self.velocity_history.clear()
 
         elif self.state == ShotState.SHOT_IN_PROGRESS:
@@ -154,10 +134,6 @@ class ShotDetector:
                         self.current_shot['end_time'] = frame_count / fps  # Record end time
                         self.current_shot['duration'] = shot_duration  # Record shot duration
                         self.shots.append(self.current_shot)  # Add shot to the list of detected shots
-                        self.logger.info(
-                            f"Shot {self.current_shot['shot_id']} ended at frame {frame_count} "
-                            f"(time {self.current_shot['end_time']:.2f}s) with duration {shot_duration:.2f}s"
-                        )
                         self.current_shot = None  # Reset current shot
                         self.state = ShotState.COOLDOWN  # Transition to COOLDOWN state
                         self.cooldown_counter = SHOT_COOLDOWN_FRAMES  # Initialize cooldown counter
@@ -165,10 +141,6 @@ class ShotDetector:
                         # If shot duration exceeds time threshold without valid end, invalidate the shot
                         self.current_shot['invalid'] = True  # Mark shot as invalid
                         self.shots.append(self.current_shot)  # Add invalid shot to the list
-                        self.logger.info(
-                            f"Shot {self.current_shot['shot_id']} invalidated due to duration "
-                            f"{shot_duration:.2f}s exceeding TIME_THRESHOLD."
-                        )
                         self.current_shot = None  # Reset current shot
                         self.state = ShotState.COOLDOWN  # Transition to COOLDOWN state
                         self.cooldown_counter = SHOT_COOLDOWN_FRAMES  # Initialize cooldown counter
@@ -182,10 +154,6 @@ class ShotDetector:
                     # Invalidate the shot if it exceeds the time threshold without completing
                     self.current_shot['invalid'] = True  # Mark shot as invalid
                     self.shots.append(self.current_shot)  # Add invalid shot to the list
-                    self.logger.info(
-                        f"Shot {self.current_shot['shot_id']} invalidated due to exceeding "
-                        f"TIME_THRESHOLD without detecting end."
-                    )
                     self.current_shot = None  # Reset current shot
                     self.state = ShotState.COOLDOWN  # Transition to COOLDOWN state
                     self.cooldown_counter = SHOT_COOLDOWN_FRAMES  # Initialize cooldown counter
@@ -196,7 +164,6 @@ class ShotDetector:
             if self.cooldown_counter <= 0:
                 # Once cooldown is complete, reset the state machine to WAITING_FOR_STABILITY
                 self.reset_shot_state()
-                self.logger.info("Cooldown complete. Transitioned to WAITING_FOR_STABILITY.")
 
     def assign_make_shot(self, make_shot):
         """

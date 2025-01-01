@@ -4,6 +4,11 @@ Right Now:
 		-YOLO weights finish (run this in the terminal):
 		python train.py --data direct1/data.yaml --resume runs/train/exp24/weights/last.pt
 
+	
+		-delete any webcam usage
+		-add toggle for visualization previews (debug logs for stages of performance and processing) 
+		-ensure doesn't redownload videos everytime (toggle for this -> development or deployment toggle)
+		
 
 		-remove uneccesary features (ex: nose)
 

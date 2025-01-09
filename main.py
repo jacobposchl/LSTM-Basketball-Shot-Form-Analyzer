@@ -9,13 +9,12 @@ import sys
 import torch
 from collections import deque
 import logging
+import shutil  # Added for directory operations
 import config
 from google.cloud import storage  # Added for GCP interactions
 
-
 # Import configurations from config.py
 from config import (
-    LABEL,
     TARGET_WIDTH,
     TARGET_HEIGHT,
     SMOOTHING_WINDOW,
@@ -34,20 +33,20 @@ from config import (
     ShotState,
     YOLO_CONFIDENCE_THRESHOLD,
     DETECTION_THRESHOLD,
-    USE_WEBCAM,
     THUMB_GESTURE_WINDOW,
     THUMB_GESTURE_THRESHOLD,
     GCP_BUCKET_NAME,
     GCP_PREFIX,
     GCP_DOWNLOAD_DIR,
     WEIGHTS_DIR,
-    YOLO_WEIGHTS_PATH
+    YOLO_WEIGHTS_PATH,
+    DEV_MODE,
+    DEV_VIDEOS
 )
 
 from shot_detection import ShotDetector
 from hand_detection import HandDetector  # Ensure this is correctly implemented
 from project_utils import calculate_angle, map_to_original  # Ensure these functions are correctly implemented
-
 
 # Initialize logging
 LOG_DIR = config.LOGS_DIR
@@ -68,8 +67,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info(f"Using config file: {config.__file__}")
 
-
-def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str) -> list:
+def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str, specific_videos: list = None) -> list:
     """
     Fetches video files from a GCP bucket and downloads them to a local directory.
 
@@ -77,6 +75,7 @@ def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str) -> l
         bucket_name (str): Name of the GCP bucket.
         prefix (str): Prefix path in the bucket to look for video files.
         download_dir (str): Local directory to download videos.
+        specific_videos (list, optional): List of specific video filenames to download. If None, download all.
 
     Returns:
         list: List of local file paths to the downloaded videos.
@@ -86,18 +85,32 @@ def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str) -> l
     blobs = bucket.list_blobs(prefix=prefix)
 
     video_files = []
+    available_videos = []
     for blob in blobs:
-        if blob.name.endswith(('.mp4', '.mov', '.avi', '.mkv')):  # Add other video formats if needed
-            local_path = os.path.join(download_dir, os.path.basename(blob.name))
-            if not os.path.exists(local_path):
-                logger.info(f"Downloading {blob.name} to {local_path}...")
+        if blob.name.endswith(('.mp4', '.mov', '.avi', '.mkv', '.MOV')):  # Add other video formats if needed
+            video_filename = os.path.basename(blob.name)
+            available_videos.append(video_filename)
+
+    logger.info(f"Available videos in bucket '{bucket_name}' with prefix '{prefix}': {available_videos}")
+
+    for video_filename in available_videos:
+        if specific_videos and video_filename not in specific_videos:
+            logger.debug(f"Skipping '{video_filename}' as it's not in DEV_VIDEOS.")
+            continue  # Skip videos not in the specified list when in DEV_MODE
+        blob = bucket.blob(os.path.join(prefix, video_filename))
+        local_path = os.path.join(download_dir, video_filename)
+        if not os.path.exists(local_path):
+            logger.info(f"Downloading {blob.name} to {local_path}...")
+            try:
                 blob.download_to_filename(local_path)
                 logger.info(f"Downloaded {blob.name} successfully.")
-            else:
-                logger.info(f"File {local_path} already exists. Skipping download.")
-            video_files.append(local_path)
+            except Exception as e:
+                logger.error(f"Failed to download {blob.name}: {e}")
+                continue
+        else:
+            logger.info(f"File {local_path} already exists. Skipping download.")
+        video_files.append(local_path)
     return video_files
-
 
 def draw_wrist_roi(frame: np.ndarray, x: float, y: float, roi_size: int, color: tuple, label: str) -> None:
     """
@@ -182,26 +195,52 @@ def draw_pose_on_original(original_frame: np.ndarray, pose_landmarks, map_to_ori
             cv2.circle(original_frame, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
 
 def main():
-    # Define output datasets directory from config.py
-    DATASETS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Datasets')
-    os.makedirs(DATASETS_DIR, exist_ok=True)
+    # Clear the GCP_Downloads directory before starting
+    if os.path.exists(config.GCP_DOWNLOAD_DIR):
+        logger.info(f"Clearing the directory: {config.GCP_DOWNLOAD_DIR}")
+        shutil.rmtree(config.GCP_DOWNLOAD_DIR)
+    os.makedirs(config.GCP_DOWNLOAD_DIR, exist_ok=True)
+    logger.info(f"Created a fresh directory: {config.GCP_DOWNLOAD_DIR}")
 
+    # Define output datasets directory from config.py
+    DATASETS_DIR = config.DATASETS_DIR
+    os.makedirs(DATASETS_DIR, exist_ok=True)
 
     # Fetch videos from GCP
     logger.info("Fetching videos from GCP bucket...")
-    gcp_videos = fetch_videos_from_gcp(
-        bucket_name=config.GCP_BUCKET_NAME,
-        prefix=config.GCP_PREFIX,
-        download_dir=config.GCP_DOWNLOAD_DIR
-    )
 
-    if not gcp_videos:
-        logger.error("No video files found in the specified GCP bucket and prefix.")
+    if config.DEV_MODE:
+        logger.info("Running in DEV_MODE: Fetching specified videos only.")
+        gcp_videos = fetch_videos_from_gcp(
+            bucket_name=config.GCP_BUCKET_NAME,
+            prefix=config.GCP_PREFIX,
+            download_dir=config.GCP_DOWNLOAD_DIR,
+            specific_videos=config.DEV_VIDEOS
+        )
+
+        # Check if all specified DEV_VIDEOS were fetched
+        missing_videos = [video for video in config.DEV_VIDEOS if os.path.join(config.GCP_DOWNLOAD_DIR, video) not in gcp_videos]
+        if missing_videos:
+            logger.warning(f"The following DEV_VIDEOS were not found and will be skipped: {missing_videos}")
+    else:
+        logger.info("Running in production mode: Fetching all videos.")
+        gcp_videos = fetch_videos_from_gcp(
+            bucket_name=config.GCP_BUCKET_NAME,
+            prefix=config.GCP_PREFIX,
+            download_dir=config.GCP_DOWNLOAD_DIR
+        )
+
+    if config.DEV_MODE:
+        INPUT_VIDEOS = [os.path.join(config.GCP_DOWNLOAD_DIR, video) for video in config.DEV_VIDEOS if os.path.join(config.GCP_DOWNLOAD_DIR, video) in gcp_videos]
+        logger.info(f"Selected DEV_MODE videos: {INPUT_VIDEOS}")
+    else:
+        INPUT_VIDEOS = gcp_videos
+        logger.info(f"Total videos fetched from GCP: {len(INPUT_VIDEOS)}")
+
+
+    if not INPUT_VIDEOS:
+        logger.error("No video files found to process.")
         sys.exit(1)
-
-    # Override INPUT_VIDEOS with GCP fetched videos
-    INPUT_VIDEOS = gcp_videos
-    logger.info(f"Total videos fetched from GCP: {len(INPUT_VIDEOS)}")
 
     # Initialize ShotDetector
     shot_detector = ShotDetector()
@@ -216,8 +255,8 @@ def main():
         static_image_mode=False,
         model_complexity=1,
         smooth_landmarks=True,
-        min_detection_confidence=0.7,
-        min_tracking_confidence=0.7
+        min_detection_confidence=config.MIN_POSE_DETECTION_CONFIDENCE,
+        min_tracking_confidence=config.MIN_POSE_TRACKING_CONFIDENCE
     )
     mp_drawing = mp.solutions.drawing_utils
 
@@ -254,7 +293,6 @@ def main():
     
     logger.info(f"Ball Class ID: {SPORTS_BALL_CLASS_ID}")
 
-
     # Track the last shot_id displayed on the feature screen
     last_shot_id_displayed = None
     last_shot_make_status = "N/A"
@@ -262,30 +300,18 @@ def main():
     # Initialize Gesture History for Thumb Gestures
     gesture_history = deque(maxlen=config.THUMB_GESTURE_WINDOW)
 
-    # Process each video or webcam
+    # Process each video
     for idx, input_video_source in enumerate(INPUT_VIDEOS):
-        if config.USE_WEBCAM:
-            logger.info(f"\nAccessing webcam {input_video_source} for video {idx+1}/{len(INPUT_VIDEOS)}")
-            try:
-                webcam_index = int(input_video_source)
-                cap = cv2.VideoCapture(webcam_index)  # Ensure it's an integer for webcam
-            except ValueError:
-                logger.error(f"Invalid webcam index: {input_video_source}. Must be an integer.")
-                continue
-        else:
-            logger.info(f"\nProcessing video {idx+1}/{len(INPUT_VIDEOS)}: {input_video_source}")
+        logger.info(f"\nProcessing video {idx+1}/{len(INPUT_VIDEOS)}: {input_video_source}")
 
-            if not os.path.isfile(input_video_source):
-                logger.error(f"Video file does not exist: {input_video_source}")
-                continue
+        if not os.path.isfile(input_video_source):
+            logger.error(f"Video file does not exist: {input_video_source}")
+            continue
 
-            cap = cv2.VideoCapture(input_video_source)
+        cap = cv2.VideoCapture(input_video_source)
 
         if not cap.isOpened():
-            if config.USE_WEBCAM:
-                logger.error(f"Could not access webcam {input_video_source}.")
-            else:
-                logger.error(f"Could not open video file: {input_video_source}")
+            logger.error(f"Could not open video file: {input_video_source}")
             continue
 
         fps = cap.get(cv2.CAP_PROP_FPS)
@@ -314,12 +340,12 @@ def main():
         # Initialize detection history deque for temporal smoothing
         detection_history = deque(maxlen=config.DETECTION_THRESHOLD)
 
-        # Initialize visualization windows for the first few videos or webcam
-        if idx < 5 or config.USE_WEBCAM:
+        # Initialize visualization windows if DEV_MODE is True
+        if config.DEV_MODE:
             cv2.namedWindow("Detection with Orientation Vectors", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Visualization", cv2.WINDOW_NORMAL)
         else:
-            logger.info("Skipping visualization for videos beyond the first 5.")
+            logger.info("DEV_MODE is False: Skipping visualization windows.")
 
         logger.info("Starting video processing...")
 
@@ -327,10 +353,7 @@ def main():
 
             ret, frame = cap.read()
             if not ret:
-                if config.USE_WEBCAM:
-                    logger.info("Webcam stream ended or disconnected.")
-                else:
-                    logger.info("End of video file reached.")
+                logger.info("End of video file reached.")
                 break
 
             frame_count += 1
@@ -374,6 +397,7 @@ def main():
                 yolo_results = model(original_frame)
             except Exception as e:
                 yolo_results = None
+                logger.error(f"YOLO detection failed on frame {frame_count}: {e}")
 
             filtered_detections = []
 
@@ -384,11 +408,12 @@ def main():
                     conf = float(conf)
                     if cls_id == SPORTS_BALL_CLASS_ID and conf >= YOLO_CONFIDENCE_THRESHOLD:
                         filtered_detections.append(det)
-                        # Draw bounding box on the original frame
-                        cv2.rectangle(original_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                        label_text = f"Ball: {conf:.2f}"
-                        cv2.putText(original_frame, label_text, (int(x1), int(y1) - 10), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                        if config.DEV_MODE:
+                            # Draw bounding box on the original frame
+                            cv2.rectangle(original_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
+                            label_text = f"Ball: {conf:.2f}"
+                            cv2.putText(original_frame, label_text, (int(x1), int(y1) - 10), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
 
             sports_ball_positions = []
             largest_ball = None
@@ -516,9 +541,8 @@ def main():
 
             # Initialize features_row with basic info
             features_row = {
-                'video': os.path.basename(input_video_source) if not config.USE_WEBCAM else 'Webcam',
-                'frame': frame_count,
-                'label': LABEL
+                'video': os.path.basename(input_video_source),
+                'frame': frame_count
             }
 
             # Safely compute sports_ball_positions
@@ -614,7 +638,7 @@ def main():
             make_status = None  # Initialize make_status
 
             # Thumbs-Up Detection Logic
-            if shot_detector.detect_hands:  # Only for the first 5 videos and if hand detection is enabled
+            if shot_detector.detect_hands:  # Only if hand detection is enabled
                 if "LEFT_WRIST" in joint_data and "RIGHT_WRIST" in joint_data:
                     # Process both wrists for thumbs-up
                     left_wrist_rel_pos = joint_data["LEFT_WRIST"]["pos"]
@@ -639,7 +663,7 @@ def main():
                     hand_detector.clear_features()
 
                     # Process hands within ROIs
-                    #Flipped the left and right wrist for the correct handedness because input video is flipped (CAN POSSIBLY CHANGE THIS IN FUTURE)
+                    # Flipped the left and right wrist for the correct handedness because input video is flipped (CAN POSSIBLY CHANGE THIS IN FUTURE)
                     for roi_pos, label in [((left_wrist_abs_pos[0], left_wrist_abs_pos[1]), "Right"), 
                                         ((right_wrist_abs_pos[0], right_wrist_abs_pos[1]), "Left")]:
                         x_center, y_center = roi_pos
@@ -666,9 +690,11 @@ def main():
                                 hand_results = hand_detector.process_frame(roi_rgb)
                             except Exception as e:
                                 hand_results = None
+                                logger.error(f"Hand detection failed in ROI: {e}")
                             if hand_results and hand_results.multi_hand_landmarks and hand_results.multi_handedness:
-                                # Draw landmarks and orientation vectors
-                                hand_detector.draw_landmarks(original_frame, hand_results.multi_hand_landmarks, hand_results.multi_handedness, draw_orientation_vectors=True)
+                                # Draw landmarks and orientation vectors if in DEV_MODE
+                                if config.DEV_MODE:
+                                    hand_detector.draw_landmarks(original_frame, hand_results.multi_hand_landmarks, hand_results.multi_handedness, draw_orientation_vectors=True)
 
                                 for hand_landmarks, hand_handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
                                     detected_handedness = hand_handedness.classification[0].label  # 'Left' or 'Right'
@@ -713,7 +739,7 @@ def main():
                 down_count = gesture_history.count('down')
 
                 # Define threshold as more than half of the window
-                half_window = math.ceil(config.THUMB_GESTURE_WINDOW * THUMB_GESTURE_THRESHOLD)
+                half_window = math.ceil(config.THUMB_GESTURE_WINDOW * config.THUMB_GESTURE_THRESHOLD)
 
                 # Update make_status based on gesture history
                 if up_count >= half_window:
@@ -722,66 +748,13 @@ def main():
                 elif down_count >= half_window:
                     make_status = "No Make"
                     shot_detector.assign_make_shot(False)
-                
-                
 
-            # Add velocities and accelerations to features_row
-            for left_joint, right_joint in PAIRED_JOINTS:
-                left_vel = joint_data[left_joint]["vel"] if left_joint in joint_data else np.nan
-                right_vel = joint_data[right_joint]["vel"] if right_joint in joint_data else np.nan
-                left_acc = joint_data[left_joint]["acc"] if left_joint in joint_data else np.nan
-                right_acc = joint_data[right_joint]["acc"] if right_joint in joint_data else np.nan
-
-                features_row[f"{left_joint}_vel"] = left_vel
-                features_row[f"{right_joint}_vel"] = right_vel
-                features_row[f"{left_joint}_acc"] = left_acc
-                features_row[f"{right_joint}_acc"] = right_acc
-
-            # Add joint positions to features_row using relative coordinates
-            for joint_name in joint_map.keys():
-                pos_x, pos_y = joint_data[joint_name]["pos"] if joint_name in joint_data else (np.nan, np.nan)
-                features_row[f"{joint_name}_pos_x"] = round(pos_x, 2) if pos_x is not None else np.nan
-                features_row[f"{joint_name}_pos_y"] = round(pos_y, 2) if pos_y is not None else np.nan
-
-            # Calculate angles using relative coordinates
-            for triplet in ANGLE_JOINTS:
-                joint_a, joint_b, joint_c = triplet
-                if (joint_a in joint_data and joint_b in joint_data and joint_c in joint_data and
-                    not any(np.isnan(joint_data[j]["pos"][0]) or np.isnan(joint_data[j]["pos"][1]) for j in [joint_a, joint_b, joint_c])):
-                    angle = calculate_angle(
-                        joint_data[joint_a]["pos"],
-                        joint_data[joint_b]["pos"],
-                        joint_data[joint_c]["pos"]
-                    )
-                    features_row[f"{joint_b}_{joint_a}_{joint_c}_angle"] = angle
-                else:
-                    features_row[f"{joint_b}_{joint_a}_{joint_c}_angle"] = np.nan
-
-            # Update features_row with shot information
-            # Properly populate 'is_shot', 'shot_id', 'shot_invalid'
-            if shot_detector.current_shot:
-                current_state = shot_detector.state.name  # Assuming state is an Enum
-                features_row['is_shot'] = 1 if shot_detector.state == ShotState.SHOT_IN_PROGRESS else 0
-                # Ensure shot_id is consistently formatted as integer
-                try:
-                    current_shot_id = int(shot_detector.current_shot.get('shot_id', np.nan))
-                except (ValueError, TypeError):
-                    current_shot_id = np.nan
-                features_row['shot_id'] = current_shot_id
-                features_row['shot_invalid'] = 1 if shot_detector.current_shot.get('invalid', False) else 0
-            else:
-                features_row['is_shot'] = 0
-                features_row['shot_id'] = np.nan
-                features_row['shot_invalid'] = 0
-
-            # Initialize 'make' column as np.nan; it will be updated based on gesture history
-            features_row['make'] = make_status if make_status in ["Make", "No Make"] else np.nan
 
             # Add the current features_row to all_data
             all_data.append(features_row)
 
-            # Draw pose landmarks on original_frame
-            if results_pose.pose_landmarks:
+            # Draw pose landmarks on original_frame if in DEV_MODE
+            if config.DEV_MODE and results_pose.pose_landmarks:
                 draw_pose_on_original(
                     original_frame,
                     results_pose.pose_landmarks,
@@ -889,8 +862,6 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
 
-
-
             # Check if a new shot has been detected to update the make status display
             if shot_detector.shots:
                 # Iterate through the shots in reverse to find the last valid shot
@@ -912,7 +883,7 @@ def main():
                     elif make_value_of_last_shot is None:
                         last_shot_make_status = "Make Status Not Detected Yet"
                     else:
-                        last_shot_make_status = "Error, Needs Vixing"
+                        last_shot_make_status = "Error, Needs Fixing"
                     
                     # Retrieve Shot ID
                     shot_id = last_valid_shot.get('shot_id', 'N/A')
@@ -953,10 +924,8 @@ def main():
             )
             y_offset += 40  # Move to the next line
 
-
-
             # Visualization
-            if idx < 5 or config.USE_WEBCAM:
+            if config.DEV_MODE:
                 # Resize frame for display
                 resized_detection_display = cv2.resize(original_frame, (config.TARGET_WIDTH // 2, config.TARGET_HEIGHT // 2))
                 cv2.imshow("Detection with Orientation Vectors", resized_detection_display)
@@ -964,22 +933,23 @@ def main():
                 # Display Feature Visualization
                 cv2.imshow("Feature Visualization", feature_screen)
             else:
-                # Display Feature Visualization
-                cv2.imshow("Feature Visualization", feature_screen)
+                # In production mode, optionally save frames or perform other non-visual actions
+                pass
 
             # Log progress every 100 frames
             if frame_count % 100 == 0:
                 logger.info(f"Processed {frame_count} frames, {frames_with_landmarks} with landmarks detected.")
 
-            # Allow exit on 'q' key press for the first 5 videos or webcam
-            key = cv2.waitKey(1) & 0xFF
-            if key == ord('q'):
-                logger.info("Exiting processing loop as 'q' was pressed.")
-                break
+            # Allow exit on 'q' key press if DEV_MODE is True
+            if config.DEV_MODE:
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord('q'):
+                    logger.info("Exiting processing loop as 'q' was pressed.")
+                    break
 
         # After exiting the loop
         cap.release()
-        if idx < 5 or config.USE_WEBCAM:
+        if config.DEV_MODE:
             cv2.destroyAllWindows()
             cv2.waitKey(1)  # Ensure all windows are closed properly
 
@@ -993,10 +963,7 @@ def main():
         # Add 'make' column initialized to np.nan
         df['make'] = np.nan
 
-        if not config.USE_WEBCAM:
-            output_csv_filename = os.path.splitext(os.path.basename(input_video_source))[0] + "_entire_dataset.csv"
-        else:
-            output_csv_filename = "Webcam_entire_dataset.csv"
+        output_csv_filename = os.path.splitext(os.path.basename(input_video_source))[0] + "_entire_dataset.csv"
 
         # Save individual shots if needed
         if 'shot_id' in df.columns:
@@ -1039,7 +1006,8 @@ def main():
     pose.close()
     if shot_detector.detect_hands and hand_detector:
         hand_detector.close()
-    cv2.destroyAllWindows()
+    if config.DEV_MODE:
+        cv2.destroyAllWindows()
     logger.info("\nAll videos have been processed and datasets have been created.")
 
 if __name__ == "__main__":

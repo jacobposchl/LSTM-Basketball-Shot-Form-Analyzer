@@ -1,19 +1,24 @@
 Right Now:
 
 	Fixes:
-		-YOLO weights finish (run this in the terminal):
-		python train.py --data direct1/data.yaml --resume runs/train/exp24/weights/last.pt
 
+		ENHANCE COMPUTATION:
+			-Test out new best.pt file -> is significant increase in accuracy?
+			-Implement DeepSORT to enhance tracking algorithm of ball
+			-Parallel computing? Can be used with DeepSORT?
+				-maybe object detection on different process that rendering skeleton?
+		
+		DATA ENGINEERING:		
+			-Determine how to use SHAP to classify what columns influence good v bad shots
+			
+		GCP COMPUTING:
+			-create VM instance for replacing local machine:
+				-has same project dependencies
 
-		-remove uneccesary features (ex: nose)
 
 TO - DO:
 
 -Data Engineering:
--Visualize Data
-	-graphs to compare features and frames
-	-any direct visual correlations??? (between good vs bad)
-		-ex. wrist_vel at frame 40 is higher significantly for good shots while at bad shots it is really low
 
 -Setup the model (LSTM architecture)
 	-Start with basic, see how accuracy performs with amount of data used ****BIG STEP
@@ -31,6 +36,4 @@ EXTRAS:
 -Add important features to outputted dataset
 	-Wrist/Hand/Finger Position/Vel
 	-Distance between all joints (instead of polynomial feature extraction)
--Better Hand Skeleton Detection
--Parallel computing
-	-compute multiple frames at the same time? 
+ 

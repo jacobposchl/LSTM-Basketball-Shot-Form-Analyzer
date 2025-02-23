@@ -1,4 +1,7 @@
 # main.py
+import warnings
+warnings.filterwarnings("ignore", category=FutureWarning)
+
 
 import cv2
 import math
@@ -12,6 +15,8 @@ import logging
 import shutil  # Added for directory operations
 import config
 from google.cloud import storage  # Added for GCP interactions
+import argparse
+
 
 # Import configurations from config.py
 from config import (
@@ -67,19 +72,19 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 logger.info(f"Using config file: {config.__file__}")
 
+def download_video_from_gcs(bucket_name: str, video_filename: str) -> str:
+    """Downloads a video from Google Cloud Storage to local storage."""
+    storage_client = storage.Client()
+    bucket = storage_client.bucket(bucket_name)
+    blob = bucket.blob(video_filename)
+    
+    local_video_path = os.path.join("Videos", os.path.basename(video_filename))
+    blob.download_to_filename(local_video_path)
+    
+    logger.info(f"Downloaded {video_filename} to {local_video_path}")
+    return local_video_path
+
 def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str, specific_videos: list = None) -> list:
-    """
-    Fetches video files from a GCP bucket and downloads them to a local directory.
-
-    Args:
-        bucket_name (str): Name of the GCP bucket.
-        prefix (str): Prefix path in the bucket to look for video files.
-        download_dir (str): Local directory to download videos.
-        specific_videos (list, optional): List of specific video filenames to download. If None, download all.
-
-    Returns:
-        list: List of local file paths to the downloaded videos.
-    """
     client = storage.Client()
     bucket = client.bucket(bucket_name)
     blobs = bucket.list_blobs(prefix=prefix)
@@ -95,7 +100,6 @@ def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str, spec
 
     for video_filename in available_videos:
         if specific_videos and video_filename not in specific_videos:
-            logger.debug(f"Skipping '{video_filename}' as it's not in DEV_VIDEOS.")
             continue  # Skip videos not in the specified list when in DEV_MODE
         blob = bucket.blob(os.path.join(prefix, video_filename))
         local_path = os.path.join(download_dir, video_filename)
@@ -113,17 +117,6 @@ def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str, spec
     return video_files
 
 def draw_wrist_roi(frame: np.ndarray, x: float, y: float, roi_size: int, color: tuple, label: str) -> None:
-    """
-    Draws an ROI rectangle around the specified wrist on the given frame.
-
-    Args:
-        frame (np.array): The image/frame to draw on.
-        x (float): The x-coordinate of the wrist.
-        y (float): The y-coordinate of the wrist.
-        roi_size (int): The size of the ROI square.
-        color (tuple): The color of the rectangle in BGR.
-        label (str): The label to display.
-    """
     if x is not None and y is not None:
         # Ensure ROI does not exceed frame boundaries
         x_min = max(int(x - roi_size / 2), 0)
@@ -140,18 +133,6 @@ def draw_wrist_roi(frame: np.ndarray, x: float, y: float, roi_size: int, color: 
 
 def draw_pose_on_original(original_frame: np.ndarray, pose_landmarks, map_to_original_func, 
                           new_width: int, new_height: int, left_pad: int, top_pad: int) -> None:
-    """
-    Draws pose landmarks on the original_frame by mapping them from the resized and padded frame.
-
-    Args:
-        original_frame (np.array): The original image/frame to draw on.
-        pose_landmarks: Pose landmarks detected by Mediapipe.
-        map_to_original_func (function): Function to map coordinates from padded frame to original frame.
-        new_width (int): Width of the resized frame before padding.
-        new_height (int): Height of the resized frame before padding.
-        left_pad (int): Left padding added to the resized frame.
-        top_pad (int): Top padding added to the resized frame.
-    """
     import mediapipe as mp
     mp_pose = mp.solutions.pose
     connections = mp_pose.POSE_CONNECTIONS
@@ -209,7 +190,7 @@ def main():
     # Fetch videos from GCP
     logger.info("Fetching videos from GCP bucket...")
 
-    if config.DEV_MODE:
+    if config.DEV_MODE in [0,2]:
         logger.info("Running in DEV_MODE: Fetching specified videos only.")
         gcp_videos = fetch_videos_from_gcp(
             bucket_name=config.GCP_BUCKET_NAME,
@@ -230,7 +211,7 @@ def main():
             download_dir=config.GCP_DOWNLOAD_DIR
         )
 
-    if config.DEV_MODE:
+    if config.DEV_MODE in [0,2]:
         INPUT_VIDEOS = [os.path.join(config.GCP_DOWNLOAD_DIR, video) for video in config.DEV_VIDEOS if os.path.join(config.GCP_DOWNLOAD_DIR, video) in gcp_videos]
         logger.info(f"Selected DEV_MODE videos: {INPUT_VIDEOS}")
     else:
@@ -341,11 +322,11 @@ def main():
         detection_history = deque(maxlen=config.DETECTION_THRESHOLD)
 
         # Initialize visualization windows if DEV_MODE is True
-        if config.DEV_MODE:
+        if config.DEV_MODE in [0,1]:
             cv2.namedWindow("Detection with Orientation Vectors", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Visualization", cv2.WINDOW_NORMAL)
         else:
-            logger.info("DEV_MODE is False: Skipping visualization windows.")
+            logger.info("DEV_MODE is either set to 2 or 3: Skipping visualization windows.")
 
         logger.info("Starting video processing...")
 
@@ -408,7 +389,7 @@ def main():
                     conf = float(conf)
                     if cls_id == SPORTS_BALL_CLASS_ID and conf >= YOLO_CONFIDENCE_THRESHOLD:
                         filtered_detections.append(det)
-                        if config.DEV_MODE:
+                        if config.DEV_MODE in [0,1]:
                             # Draw bounding box on the original frame
                             cv2.rectangle(original_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
                             label_text = f"Ball: {conf:.2f}"
@@ -558,24 +539,73 @@ def main():
                 features_row['sports_ball_positions'] = np.nan
 
             # Shot Detection Logic
-            if "LEFT_WRIST" in joint_data:
-                wrist_vel = joint_data["LEFT_WRIST"]["vel"]
-                wrist_abs_y = joint_data["LEFT_WRIST"]["pos"][1]
+            #If both left wrist and right wrist are detected
+            if "LEFT_WRIST" in joint_data and "RIGHT_WRIST"in joint_data:
+                left_wrist_vel = joint_data["LEFT_WRIST"]["vel"]
+                right_wrist_vel = joint_data["RIGHT_WRIST"]["vel"]
+                left_wrist_abs_pos = joint_data["LEFT_WRIST"]["pos"]
+                right_wrist_abs_pos = joint_data["RIGHT_WRIST"]["pos"]
+
                 # Ball position (relative)
                 ball_pos = (
                     sports_ball_positions[0][0] - skeleton_center_x,
                     sports_ball_positions[0][1] - skeleton_center_y
                 ) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None
 
-                # Update ShotDetector
                 shot_detector.update(
-                    wrist_vel=wrist_vel,
-                    wrist_abs_y=wrist_abs_y,
-                    wrist_pos=joint_data["LEFT_WRIST"]["pos"],
+                    left_wrist_vel=left_wrist_vel,
+                    right_wrist_vel = right_wrist_vel,
+                    right_wrist_abs_pos = right_wrist_abs_pos,
+                    left_wrist_abs_pos = left_wrist_abs_pos,
                     ball_pos=ball_pos,
                     fps=fps,
                     frame_count=frame_count
                 )
+            #If only the left wrist is detected
+            elif ("LEFT_WRIST" in joint_data):
+                left_wrist_vel = joint_data["LEFT_WRIST"]["vel"]
+                right_wrist_vel = None
+                left_wrist_abs_pos = joint_data["LEFT_WRIST"]["pos"]
+                right_wrist_abs_pos = None
+                
+                # Ball position (relative)
+                ball_pos = (
+                    sports_ball_positions[0][0] - skeleton_center_x,
+                    sports_ball_positions[0][1] - skeleton_center_y
+                ) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None
+
+                shot_detector.update(
+                    left_wrist_vel=left_wrist_vel,
+                    right_wrist_vel = right_wrist_vel,
+                    right_wrist_abs_pos = right_wrist_abs_pos,
+                    left_wrist_abs_pos = left_wrist_abs_pos,
+                    ball_pos=ball_pos,
+                    fps=fps,
+                    frame_count=frame_count
+                )
+            #If only the right wrist is detected
+            elif ("RIGHT_WRIST" in joint_data):
+                left_wrist_vel = None
+                right_wrist_vel = joint_data["RIGHT_WRIST"]["vel"]
+                left_wrist_abs_pos = None
+                right_wrist_abs_pos = joint_data["RIGHT_WRIST"]["pos"]
+                
+                # Ball position (relative)
+                ball_pos = (
+                    sports_ball_positions[0][0] - skeleton_center_x,
+                    sports_ball_positions[0][1] - skeleton_center_y
+                ) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None
+
+                shot_detector.update(
+                    left_wrist_vel=left_wrist_vel,
+                    right_wrist_vel = right_wrist_vel,
+                    right_wrist_abs_pos = right_wrist_abs_pos,
+                    left_wrist_abs_pos = left_wrist_abs_pos,
+                    ball_pos=ball_pos,
+                    fps=fps,
+                    frame_count=frame_count
+                )
+            #No wrists are detectd, reset the state
             else:
                 # No LEFT_WRIST found, possibly reset shot_state or handle accordingly
                 shot_detector.reset_shot_state()
@@ -693,7 +723,7 @@ def main():
                                 logger.error(f"Hand detection failed in ROI: {e}")
                             if hand_results and hand_results.multi_hand_landmarks and hand_results.multi_handedness:
                                 # Draw landmarks and orientation vectors if in DEV_MODE
-                                if config.DEV_MODE:
+                                if config.DEV_MODE in [0,1]:
                                     hand_detector.draw_landmarks(original_frame, hand_results.multi_hand_landmarks, hand_results.multi_handedness, draw_orientation_vectors=True)
 
                                 for hand_landmarks, hand_handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
@@ -701,7 +731,6 @@ def main():
                                     
                                     
                                     if detected_handedness != label:
-                                        logger.debug(f"Handedness mismatch in {label} ROI: Detected {detected_handedness}")
                                         continue  # Skip processing this hand as it doesn't match the ROI's expected handedness
 
                                     hands_detected += 1
@@ -754,7 +783,7 @@ def main():
             all_data.append(features_row)
 
             # Draw pose landmarks on original_frame if in DEV_MODE
-            if config.DEV_MODE and results_pose.pose_landmarks:
+            if config.DEV_MODE in [0,1] and results_pose.pose_landmarks:
                 draw_pose_on_original(
                     original_frame,
                     results_pose.pose_landmarks,
@@ -801,14 +830,15 @@ def main():
             y_offset += 40
 
             # Distance between Ball and Wrist
-            if "LEFT_WRIST" in joint_data and sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None:
-                distance = shot_detector.distance  # Assuming shot_detector calculates this
-                color_dist = (0, 255, 0) if shot_detector.is_ball_close else (0, 0, 255)
-                cv2.putText(feature_screen, f"Ball-Wrist Dist: {distance:.2f}", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_dist, 2)
-            else:
-                cv2.putText(feature_screen, "Ball-Wrist Dist: N/A", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            if "LEFT_WRIST" in joint_data or "RIGHT_WRIST" in joint_data:
+                if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None:
+                    distance = shot_detector.distance  # Assuming shot_detector calculates this
+                    color_dist = (0, 255, 0) if shot_detector.is_ball_close else (0, 0, 255)
+                    cv2.putText(feature_screen, f"Ball-Wrist Dist: {distance:.2f}", (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_dist, 2)
+                else:
+                    cv2.putText(feature_screen, "Ball-Wrist Dist: N/A", (10, y_offset),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
 
             # Thumbs Up Count
@@ -925,7 +955,7 @@ def main():
             y_offset += 40  # Move to the next line
 
             # Visualization
-            if config.DEV_MODE:
+            if config.DEV_MODE in [0,1]:
                 # Resize frame for display
                 resized_detection_display = cv2.resize(original_frame, (config.TARGET_WIDTH // 2, config.TARGET_HEIGHT // 2))
                 cv2.imshow("Detection with Orientation Vectors", resized_detection_display)
@@ -936,20 +966,21 @@ def main():
                 # In production mode, optionally save frames or perform other non-visual actions
                 pass
 
-            # Log progress every 100 frames
-            if frame_count % 100 == 0:
+            # Log progress every 20 frames
+            if frame_count % 20 == 0:
                 logger.info(f"Processed {frame_count} frames, {frames_with_landmarks} with landmarks detected.")
 
-            # Allow exit on 'q' key press if DEV_MODE is True
-            if config.DEV_MODE:
+            # Allow exit on 'q' key press if DEV_MODE is either set to 0 or 1
+            if config.DEV_MODE in [0,1]:
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q'):
                     logger.info("Exiting processing loop as 'q' was pressed.")
                     break
 
         # After exiting the loop
+        logger.info("FINISHED EXITING OUT OF WHILE LOOP.")
         cap.release()
-        if config.DEV_MODE:
+        if config.DEV_MODE in [0,1]:
             cv2.destroyAllWindows()
             cv2.waitKey(1)  # Ensure all windows are closed properly
 
@@ -1006,9 +1037,10 @@ def main():
     pose.close()
     if shot_detector.detect_hands and hand_detector:
         hand_detector.close()
-    if config.DEV_MODE:
+    if config.DEV_MODE in [0,1]:
         cv2.destroyAllWindows()
-    logger.info("\nAll videos have been processed and datasets have been created.")
+    logger.info("\nAll videos have been processed and datasets have been created. Now Exiting the Program!")
+    sys.exit(0)
 
 if __name__ == "__main__":
     main()

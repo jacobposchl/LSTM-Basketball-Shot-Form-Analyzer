@@ -8,16 +8,24 @@ from enum import Enum, auto
 # Development Mode Configuration
 # ===================================
 
-DEV_MODE = True  # Set to True for development mode with visualizations and specific video files
+DEV_MODE = 2
+#Visualize processing of specific videos in bucket -> 0
+#Visualize processing of all videos in bucket      -> 1
+#Only render specific videos in bucket             -> 2
+#Only render all videos in bucket                  -> 3
 
-# List of specific video filenames to process when DEV_MODE is True
+DOMINANT_HAND = "RIGHT"
+
+
 DEV_VIDEOS = [
-    "long_vid.mov"
+    "latest_vid.MOV"
 ]
 """
 Available videos:
-- latest_vid.MOV
-- long_vid.mov
+- latest_vid.MOV -> Newest video, hard for yolo to detect balls
+- long_vid.mov -> uncut long vid, easy for yolo to detect balls
+- long_vid_final.mov -> trimmed long vid, easy for yolo to detect balls
+- thumbs_up_short.mov -> short video for thumbs up count development
 """
 
 
@@ -52,6 +60,16 @@ CONSECUTIVE_FRAMES = 4            # Number of consecutive frames with high veloc
 DISTANCE_THRESHOLD = 150.0         # Distance the ball must move to validate a shot
 TIME_THRESHOLD = 2.0               # Time within which the ball must move after shot initiation (in seconds)
 VERTICAL_DISPLACEMENT_THRESHOLD = 50.0  # Minimum upward displacement for shot detection
+
+
+WRIST_CLOSE_DISTANCE_THRESHOLD = 100.0
+PROBABILITY_INCREMENT_BALL_CLOSE = 0.20
+MIN_PROBABILITY = 0.00
+MAX_PROBABILITY = 1.00
+PROBABILITY_INCREMENT_WRISTS_CLOSE = 0.10
+PROBABILITY_DECREMENT_UNSTABLE = 0.15
+
+
 
 # Stability Thresholds
 STABLE_FRAMES_REQUIRED = 2            # Number of consecutive stable frames required
@@ -166,3 +184,4 @@ class ShotState(Enum):
     READY_TO_DETECT_SHOT = auto()
     SHOT_IN_PROGRESS = auto()
     COOLDOWN = auto()
+# Test Write

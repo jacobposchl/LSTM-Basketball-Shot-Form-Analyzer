@@ -3,17 +3,17 @@
 import os
 from enum import Enum, auto
 
-
+#
 # ===================================
 # Development Mode Configuration
 # ===================================
 
-DEV_MODE = 2
-#Visualize processing of specific videos in bucket -> 0
-#Visualize processing of all videos in bucket      -> 1
-#Only render specific videos in bucket             -> 2
-#Only render all videos in bucket                  -> 3
-
+DEV_MODE = 0
+#Visualize processing of specific videos in bucket          -> 0 USED FOR VISULIZATION
+#Visualize processing of all videos in bucket               -> 1
+#DONT Visualize and process specific videos in bucket       -> 2 USED FOR PRODUCTION
+#DONT Visualize and process all videos in bucket            -> 3
+ 
 DOMINANT_HAND = "RIGHT"
 
 
@@ -41,7 +41,7 @@ GCP_DOWNLOAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'GCP
 os.makedirs(GCP_DOWNLOAD_DIR, exist_ok=True)
 
 # YOLO Weights Path (ensure this points to the correct location on the VM)
-YOLO_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Weights', 'old_best_v2.pt')
+YOLO_WEIGHTS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Weights', 'new_weights.pt')
 """
 Available weights:
 - old_best.pt
@@ -55,11 +55,11 @@ Available weights:
 # ===================================
 
 # Shot Detection Thresholds
-VELOCITY_THRESHOLD = 150.0        # Velocity required to detect a shot
-CONSECUTIVE_FRAMES = 4            # Number of consecutive frames with high velocity
-DISTANCE_THRESHOLD = 150.0         # Distance the ball must move to validate a shot
-TIME_THRESHOLD = 2.0               # Time within which the ball must move after shot initiation (in seconds)
-VERTICAL_DISPLACEMENT_THRESHOLD = 50.0  # Minimum upward displacement for shot detection
+VELOCITY_THRESHOLD = 150.0        # Velocity required to detect a shot -> INITIALLY (150)
+CONSECUTIVE_FRAMES = 3            # Number of consecutive frames with high velocity
+DISTANCE_THRESHOLD = 50.0         # Distance the ball must move to validate a shot -> INITIALLY (150)
+TIME_THRESHOLD = 1.6               # Time within which the ball must move after shot initiation (in seconds) -> INITIALLY (2)
+VERTICAL_DISPLACEMENT_THRESHOLD = 15.0  # Minimum upward displacement for shot detection -> INITIALLY (50)
 
 
 WRIST_CLOSE_DISTANCE_THRESHOLD = 100.0
@@ -90,7 +90,7 @@ TARGET_HEIGHT = 1280                    # Target height for resizing frames (Sma
 TARGET_WIDTH = 720                     # Target width for resizing frames
 
 # Cooldown Parameters
-SHOT_COOLDOWN_FRAMES = 30               # Cooldown period after shot detection to prevent immediate re-detection
+SHOT_COOLDOWN_FRAMES = 15               # Cooldown period after shot detection to prevent immediate re-detection
 
 # Pose Detection Thresholds
 MIN_POSE_DETECTION_CONFIDENCE = 0.7      # Minimum confidence for pose detection
@@ -132,7 +132,7 @@ os.makedirs(YOLOV5_DIR, exist_ok=True)
 INPUT_VIDEOS = []  # This will be populated dynamically based on DEV_MODE
 
 # YOLO Weights Path
-YOLO_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, 'old_best_v1.pt')
+YOLO_WEIGHTS_PATH = os.path.join(WEIGHTS_DIR, 'new_weights.pt')
 # Best currently -> old_best_v1
 # Currently training -> best
 

@@ -1,0 +1,18 @@
+# Use the official TensorFlow GPU image
+FROM tensorflow/tensorflow:2.19.0-gpu
+
+# Set the working directory inside the container
+WORKDIR /app
+
+# Copy lstm_model.py into the container
+COPY lstm_model.py /app/lstm_model.py
+
+# Upgrade pip and install required packages.
+RUN pip install --upgrade pip && \
+    pip install matplotlib seaborn scikit-learn pandas google-cloud-pubsub firestore
+
+# Set the ENTRYPOINT so that additional arguments are appended.
+ENTRYPOINT ["python", "lstm_model.py"]
+
+# Provide default CMD arguments (can be overridden)
+CMD ["--data_dir", "/data"]

@@ -15,7 +15,13 @@ import logging
 import shutil  # For directory operations
 import argparse
 from google.cloud import storage  # For GCP interactions
+from google.cloud import pubsub_v1 # For GCP Pub/Sub message sending
+from google.cloud import firestore
+from logging.handlers import RotatingFileHandler
 import config
+import uuid #for unique ID of dataset 
+import json
+
 
 # Import configurations from config.py
 from config import (
@@ -33,6 +39,8 @@ from config import (
     BALL_WRIST_DISTANCE_THRESHOLD,
     STABLE_FRAMES_REQUIRED,
     STABLE_VELOCITY_THRESHOLD,
+    WRIST_CLOSE_DISTANCE_THRESHOLD,
+    MAX_BALL_INVISIBLE_FRAMES,
     SHOT_COOLDOWN_FRAMES,
     ShotState,
     YOLO_CONFIDENCE_THRESHOLD,
@@ -42,7 +50,6 @@ from config import (
     GCP_BUCKET_NAME,
     GCP_PREFIX,
     GCP_DOWNLOAD_DIR,
-    WEIGHTS_DIR,
     YOLO_WEIGHTS_PATH,
     DEV_MODE,
     DEV_VIDEOS,
@@ -51,23 +58,26 @@ from config import (
 )
 
 from shot_detection import ShotDetector
-from hand_detection import HandDetector  # Ensure this is correctly implemented
 from project_utils import calculate_angle, map_to_original  # Ensure these functions are correctly implemented
 
 # Initialize logging
 os.makedirs(LOGS_DIR, exist_ok=True)
 LOG_FILENAME = 'app.log'
 LOG_FILEPATH = os.path.join(LOGS_DIR, LOG_FILENAME)
+
+rotating_handler = RotatingFileHandler(LOG_FILEPATH, maxBytes=10*1024*1024, backupCount=5)
+
 logging.basicConfig(
-    level=logging.DEBUG,  # Set to DEBUG for detailed logs
+    level=logging.DEBUG,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILEPATH, mode='w'),  # Overwrites the log file each run
-        logging.StreamHandler(sys.stdout)             # Logs to console
+        rotating_handler,
+        logging.StreamHandler(sys.stdout)
     ]
 )
+
 logger = logging.getLogger(__name__)
-logger.info(f"Using config file: {config.__file__}")
+logger.info("Logging initialized with rotation")
 
 def download_video_from_gcs(bucket_name: str, video_filename: str) -> str:
     """Downloads a video from Google Cloud Storage to local storage."""
@@ -111,7 +121,7 @@ def fetch_videos_from_gcp(bucket_name: str, prefix: str, download_dir: str, spec
             except Exception as e:
                 logger.error(f"Failed to download {blob.name}: {e}")
                 continue
-        else:
+        else: 
             logger.info(f"File {local_path} already exists. Skipping download.")
         video_files.append(local_path)
     return video_files
@@ -149,19 +159,46 @@ def draw_pose_on_original(original_frame: np.ndarray, pose_landmarks, map_to_ori
         start_idx, end_idx = connection
         start_point = landmark_coords_original[start_idx]
         end_point = landmark_coords_original[end_idx]
-        if None not in start_point and None not in end_idx:
+        if None not in start_point and None not in end_point:
             cv2.line(original_frame, (int(start_point[0]), int(start_point[1])),
-                             (int(end_point[0]), int(end_point[1])), (0, 255, 0), 2)
+                             (int(end_point[0]), int(end_point[1])), (0, 255, 0), 1)
     for point in landmark_coords_original:
         if None not in point:
-            cv2.circle(original_frame, (int(point[0]), int(point[1])), 5, (0, 0, 255), -1)
+            cv2.circle(original_frame, (int(point[0]), int(point[1])), 2, (0, 0, 255), -1)
 
 def main():
+
     # Parse CLI arguments; if --video is provided, process only that file.
     parser = argparse.ArgumentParser()
     parser.add_argument("--video", required=False, help="GCS video path (gs://bucket-name/video.mp4)")
+    parser.add_argument("--job_id", required=True, help="Unique job id provided by the mobile app")
+    parser.add_argument("--gesture_events", help="JSON string of gesture events")
+    parser.add_argument("--gesture_events_file", help="Path to JSON file with gesture_events")
     args = parser.parse_args()
 
+    # load them:
+    if args.gesture_events_file:
+        with open(args.gesture_events_file) as f:
+            gesture_events = json.load(f)
+    elif args.gesture_events:
+        gesture_events = json.loads(args.gesture_events)
+    else:
+        gesture_events = []
+    
+    logger.info(f"📦 Loaded gesture_events payload (count={len(gesture_events)}): {gesture_events}")
+
+
+    job_id = args.job_id
+
+    db = firestore.Client()
+    job_ref = db.collection("jobs").document(job_id)
+    logger.info(f"Using job document ID: {job_id}")\
+
+    job_doc = job_ref.get().to_dict()
+    # //ADD BACK ONCE DONE DEVELOPING
+    #if job_doc.get("main_py_status") == "completed":
+    #    logger.info("Job already processed, exiting.")
+    #   sys.exit(0)
     # If a specific video is provided via CLI, download that file only.
     if args.video:
         if args.video.startswith("gs://"):
@@ -169,6 +206,11 @@ def main():
             video_filename = "/".join(args.video.split("/")[3:])
             logger.info(f"Processing video from GCS path: {args.video}")
             INPUT_VIDEOS = [download_video_from_gcs(bucket_name, video_filename)]
+            job_ref.update({
+                "video_upload_progress": 1.0,
+                "video_upload_status": "completed",
+                "updated_at": firestore.SERVER_TIMESTAMP
+            })
         else:
             logger.error("Provided video path must start with 'gs://'")
             sys.exit(1)
@@ -212,13 +254,19 @@ def main():
             INPUT_VIDEOS = gcp_videos
             logger.info(f"Total videos fetched from GCP: {len(INPUT_VIDEOS)}")
 
+        # Update job: video upload completed if videos are fetched
+        job_ref.update({
+            "video_upload_progress": 1.0,
+            "video_upload_status": "completed",
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+    
     if not INPUT_VIDEOS:
         logger.error("No video files found to process.")
         sys.exit(1)
 
     # Initialize detectors and models.
     shot_detector = ShotDetector()
-    hand_detector = HandDetector()
 
     import mediapipe as mp
     mp_pose = mp.solutions.pose
@@ -245,7 +293,7 @@ def main():
         sys.exit(1)
 
     class_names = model.names
-    SPORTS_BALL_CLASS_NAME = "ball"
+    SPORTS_BALL_CLASS_NAME = "basketball"
     SPORTS_BALL_CLASS_ID = None
     if isinstance(model.names, dict):
         for class_id, class_name in model.names.items():
@@ -282,6 +330,8 @@ def main():
         logger.info(f"Original Video Properties - FPS: {fps}, Width: {original_width}, Height: {original_height}")
         logger.info(f"Resizing all frames to {config.TARGET_WIDTH}x{config.TARGET_HEIGHT} for pose estimation.")
 
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
         prev_positions = {}
         prev_velocities = {}
         all_data = []
@@ -295,13 +345,23 @@ def main():
         joint_acc_history = {joint_name: deque(maxlen=config.SMOOTHING_WINDOW) for joint_name in joint_map.keys()}
         detection_history = deque(maxlen=config.DETECTION_THRESHOLD)
 
+        # Initialize variables for y-velocity calculation
+        prev_left_wrist_y = None
+        prev_right_wrist_y = None
+        prev_ball_y = None
+        prev_ball_pos = None
+        prev_ball_frame = 0
+
         if config.DEV_MODE in [0, 1]:
             cv2.namedWindow("Detection with Orientation Vectors", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Visualization", cv2.WINDOW_NORMAL)
+            cv2.resizeWindow("Detection with Orientation Vectors", 600, 800)
+            cv2.resizeWindow("Feature Visualization", 600, 800)
         else:
             logger.info("DEV_MODE is set to 2 or 3: Skipping visualization windows.")
 
         logger.info("Starting video processing...")
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -365,6 +425,11 @@ def main():
             if largest_ball:
                 sports_ball_positions = [largest_ball]
                 valid_ball_detected = True
+                prev_ball_pos = largest_ball           # <— store last-known
+                prev_ball_frame = frame_count
+            elif 'prev_ball_pos' in locals() and frame_count - prev_ball_frame <= MAX_BALL_INVISIBLE_FRAMES:
+                sports_ball_positions = [prev_ball_pos]
+                valid_ball_detected = True
             else:
                 sports_ball_positions = []
                 valid_ball_detected = False
@@ -372,6 +437,9 @@ def main():
             skeleton_center_x = None
             skeleton_center_y = None
             normalized_hip_center_y = None
+
+
+
             if results_pose and results_pose.pose_landmarks:
                 landmarks = results_pose.pose_landmarks.landmark
                 left_hip = landmarks[joint_map["LEFT_HIP"]]
@@ -431,6 +499,38 @@ def main():
                     prev_positions[joint_name] = current_pos
                     prev_velocities[joint_name] = raw_velocity
 
+            # --- Compute y-direction velocities for visualization ---
+            if "LEFT_WRIST" in joint_data:
+                current_left_wrist_y = joint_data["LEFT_WRIST"]["pos"][1]
+                if prev_left_wrist_y is not None:
+                    left_wrist_velocity_y = abs(current_left_wrist_y - prev_left_wrist_y) * fps
+                else:
+                    left_wrist_velocity_y = 0.0
+                prev_left_wrist_y = current_left_wrist_y
+            else:
+                left_wrist_velocity_y = 0.0
+
+            if "RIGHT_WRIST" in joint_data:
+                current_right_wrist_y = joint_data["RIGHT_WRIST"]["pos"][1]
+                if prev_right_wrist_y is not None:
+                    right_wrist_velocity_y = abs(current_right_wrist_y - prev_right_wrist_y) * fps
+                else:
+                    right_wrist_velocity_y = 0.0
+                prev_right_wrist_y = current_right_wrist_y
+            else:
+                right_wrist_velocity_y = 0.0
+
+            if valid_ball_detected and skeleton_center_y is not None:
+                current_ball_y = sports_ball_positions[0][1] - skeleton_center_y
+                if prev_ball_y is not None:
+                    ball_velocity_y = abs(current_ball_y - prev_ball_y) * fps
+                else:
+                    ball_velocity_y = 0.0
+                prev_ball_y = current_ball_y
+            else:
+                ball_velocity_y = 0.0
+            # -----------------------------------------------------------
+
             features_row = {'video': os.path.basename(input_video_source), 'frame': frame_count}
             if skeleton_center_x is not None and skeleton_center_y is not None and sports_ball_positions:
                 ball_relative_pos = (
@@ -440,6 +540,15 @@ def main():
                 features_row['sports_ball_positions'] = f"{round(ball_relative_pos[0],2)},{round(ball_relative_pos[1],2)}"
             else:
                 features_row['sports_ball_positions'] = np.nan
+
+
+            # ─── LOWER-BODY: Hip‐Center Y ──────────────────────────
+            # WHAT: Raw & normalized vertical position of hip midpoint.
+            # WHY: Reflects overall body rise (leg extension) during shot.
+            features_row["hip_center_y"]      = round(skeleton_center_y, 2) if skeleton_center_y is not None else np.nan
+            features_row["hip_center_y_norm"] = round(normalized_hip_center_y, 3) if normalized_hip_center_y is not None else np.nan
+            # ───────────────────────────────────────────────────────
+
 
             # Shot detection based on available wrist data.
             if "LEFT_WRIST" in joint_data and "RIGHT_WRIST" in joint_data:
@@ -475,7 +584,23 @@ def main():
             else:
                 shot_detector.reset_shot_state()
 
-            for left_joint, right_joint in PAIRED_JOINTS:
+            # ─── LOWER-BODY: Stance Width ─────────────────────────
+            # WHAT: Horizontal distance between left & right ankle (pixels).
+            # WHY: Wider stance often correlates with greater stability.
+            if "LEFT_ANKLE" in joint_data and "RIGHT_ANKLE" in joint_data:
+                lx, _ = joint_data["LEFT_ANKLE"]["pos"]
+                rx, _ = joint_data["RIGHT_ANKLE"]["pos"]
+                features_row["stance_width"] = round(abs(rx - lx), 2)
+            else:
+                features_row["stance_width"] = np.nan
+            # ───────────────────────────────────────────────────────
+
+
+
+
+            for left_joint, right_joint in PAIRED_JOINTS + [("LEFT_HIP","RIGHT_HIP"),
+                                                            ("LEFT_KNEE","RIGHT_KNEE"),
+                                                            ("LEFT_ANKLE","RIGHT_ANKLE")]:
                 features_row[f"{left_joint}_vel"] = joint_data[left_joint]["vel"] if left_joint in joint_data else np.nan
                 features_row[f"{right_joint}_vel"] = joint_data[right_joint]["vel"] if right_joint in joint_data else np.nan
                 features_row[f"{left_joint}_acc"] = joint_data[left_joint]["acc"] if left_joint in joint_data else np.nan
@@ -517,80 +642,19 @@ def main():
             thumbs_down_count = 0
             make_status = None
 
-            if shot_detector.detect_hands:
-                if "LEFT_WRIST" in joint_data and "RIGHT_WRIST" in joint_data:
-                    left_wrist_rel_pos = joint_data["LEFT_WRIST"]["pos"]
-                    right_wrist_rel_pos = joint_data["RIGHT_WRIST"]["pos"]
-                    left_wrist_abs_pos = (skeleton_center_x + left_wrist_rel_pos[0], skeleton_center_y + left_wrist_rel_pos[1]) if skeleton_center_x is not None and skeleton_center_y is not None else (None, None)
-                    right_wrist_abs_pos = (skeleton_center_x + right_wrist_rel_pos[0], skeleton_center_y + right_wrist_rel_pos[1]) if skeleton_center_x is not None and skeleton_center_y is not None else (None, None)
-                    if left_wrist_abs_pos[0] is not None and left_wrist_abs_pos[1] is not None:
-                        draw_wrist_roi(original_frame, left_wrist_abs_pos[0], left_wrist_abs_pos[1], config.ROI_SIZE, (255, 0, 0), "Left Wrist")
-                    if right_wrist_abs_pos[0] is not None and right_wrist_abs_pos[1] is not None:
-                        draw_wrist_roi(original_frame, right_wrist_abs_pos[0], right_wrist_abs_pos[1], config.ROI_SIZE, (0, 255, 0), "Right Wrist")
-                    hands_detected = 0
-                    thumbs_up_count = 0
-                    thumbs_down_count = 0
-                    hand_detector.clear_features()
-                    # Process hands within ROIs; note the flipped labels as before.
-                    for roi_pos, label in [((left_wrist_abs_pos[0], left_wrist_abs_pos[1]), "Right"), 
-                                           ((right_wrist_abs_pos[0], right_wrist_abs_pos[1]), "Left")]:
-                        x_center, y_center = roi_pos
-                        if x_center is None or y_center is None:
-                            continue
-                        x_min = max(int(x_center - 75), 0)
-                        y_min = max(int(y_center - 75), 0)
-                        x_max = min(int(x_center + 75), original_width)
-                        y_max = min(int(y_center + 75), original_height)
-                        if x_min >= x_max or y_min >= y_max:
-                            continue
-                        roi_frame = original_frame[y_min:y_max, x_min:x_max]
-                        if roi_frame.size == 0:
-                            continue
-                        roi_rgb = cv2.cvtColor(roi_frame, cv2.COLOR_BGR2RGB)
-                        if hand_detector:
-                            try:
-                                hand_results = hand_detector.process_frame(roi_rgb)
-                            except Exception as e:
-                                hand_results = None
-                                logger.error(f"Hand detection failed in ROI: {e}")
-                            if hand_results and hand_results.multi_hand_landmarks and hand_results.multi_handedness:
-                                if config.DEV_MODE in [0, 1]:
-                                    hand_detector.draw_landmarks(original_frame, hand_results.multi_hand_landmarks, hand_results.multi_handedness, draw_orientation_vectors=True)
-                                for hand_landmarks, hand_handedness in zip(hand_results.multi_hand_landmarks, hand_results.multi_handedness):
-                                    detected_handedness = hand_handedness.classification[0].label
-                                    if detected_handedness != label:
-                                        continue
-                                    hands_detected += 1
-                                    is_up = hand_detector.is_thumbs_up(hand_landmarks, detected_handedness)
-                                    is_down = hand_detector.is_thumbs_down(hand_landmarks, detected_handedness)
-                                    if is_up:
-                                        thumbs_up_count += 1
-                                    if is_down:
-                                        thumbs_down_count += 1
-
-            if shot_detector.detect_hands:
-                if thumbs_up_count >= 2:
-                    current_gesture = 'up'
-                elif thumbs_down_count >= 2:
-                    current_gesture = 'down'
-                elif thumbs_up_count == 1:
-                    current_gesture = 'up'
-                elif thumbs_down_count == 1:
-                    current_gesture = 'down'
-                else:
-                    current_gesture = 'none'
-                gesture_history.append(current_gesture)
-                up_count = gesture_history.count('up')
-                down_count = gesture_history.count('down')
-                half_window = math.ceil(config.THUMB_GESTURE_WINDOW * config.THUMB_GESTURE_THRESHOLD)
-                if up_count >= half_window:
-                    make_status = "Make"
-                    shot_detector.assign_make_shot(True)
-                elif down_count >= half_window:
-                    make_status = "No Make"
-                    shot_detector.assign_make_shot(False)
+            
 
             all_data.append(features_row)
+
+            if total_frames > 0 and frame_count % 10 == 0:
+                progress_fraction = min(frame_count / total_frames, 1.0)
+
+                job_ref.update({
+                    "main_py_progress": progress_fraction,
+                    "main_py_status": "in_progress",
+                    "updated_at": firestore.SERVER_TIMESTAMP
+                })
+                logger.debug(f"Updated main_py_progress: {progress_fraction:.2f}")
 
             if config.DEV_MODE in [0, 1] and results_pose.pose_landmarks:
                 draw_pose_on_original(original_frame, results_pose.pose_landmarks, map_to_original, new_width, new_height, left_pad, top_pad)
@@ -630,37 +694,128 @@ def main():
                     cv2.putText(feature_screen, "Ball-Wrist Dist: N/A", (10, y_offset),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
-            if shot_detector.detect_hands:
-                color_thumbs = (0, 255, 0) if thumbs_up_count == 2 else ((0, 255, 255) if thumbs_up_count == 1 else (0, 0, 255))
-                cv2.putText(feature_screen, f"Thumbs Ups: {thumbs_up_count}", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_thumbs, 2)
+
+            if (shot_detector.wrist_distance):
+                wrist_dist = shot_detector.wrist_distance
             else:
-                cv2.putText(feature_screen, "Thumbs Ups: N/A", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                wrist_dist = 0.0
+            are_close = shot_detector.are_wrists_close
+
+            cv2.putText(
+                feature_screen,
+                f"WristDist: {wrist_dist:.1f}/{WRIST_CLOSE_DISTANCE_THRESHOLD:.1f}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 200, 150), 2
+            )
             y_offset += 40
-            if shot_detector.detect_hands:
-                color_thumbs = (0, 255, 0) if thumbs_down_count == 2 else ((0, 255, 255) if thumbs_down_count == 1 else (0, 0, 255))
-                cv2.putText(feature_screen, f"Thumbs Downs: {thumbs_down_count}", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_thumbs, 2)
-            else:
-                cv2.putText(feature_screen, "Thumbs Downs: N/A", (10, y_offset),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+
+            cv2.putText(
+                feature_screen,
+                f"WristsClose: {are_close}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (150, 200, 150), 2
+            )
             y_offset += 40
-            detect_hands_text = "Detect Hands: True" if shot_detector.detect_hands else "Detect Hands: False"
-            color_detect_hands = (0, 255, 0) if shot_detector.detect_hands else (0, 0, 255)
-            cv2.putText(feature_screen, detect_hands_text, (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_detect_hands, 2)
-            y_offset += 40
-            if shot_detector.shots:
-                if make_status in ["Make", "No Make"]:
-                    make_status_text = f"Current Make Status: {make_status}"
-                else:
-                    make_status_text = "Make Status: No Thumb Gestures Detected Yet"
-            else:
-                make_status_text = "Make Status: No Shots Detected Yet"
-            cv2.putText(feature_screen, make_status_text, (10, y_offset),
+
+            # --- Display the new y-velocity features ---
+            cv2.putText(feature_screen, f"Ball Vel (Y): {ball_velocity_y:.2f}", (10, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
+            
+            # Show left‐wrist Y‐velocity against the “stable” threshold
+            cv2.putText(
+                feature_screen,
+                f"LVelY: {left_wrist_velocity_y:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
+            )
+            y_offset += 40
+
+            # Show right‐wrist Y‐velocity against the “stable” threshold
+            cv2.putText(
+                feature_screen,
+                f"RVelY: {right_wrist_velocity_y:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
+            )
+            y_offset += 40
+
+            displacement = 0.0
+            if shot_detector.baseline_wrist_y is not None:
+                # choose dominant wrist
+                dom_joint = "RIGHT_WRIST" if config.DOMINANT_HAND == "RIGHT" else "LEFT_WRIST"
+                if dom_joint in joint_data:
+                    current_y = joint_data[dom_joint]["pos"][1]
+                    displacement = shot_detector.baseline_wrist_y - current_y
+
+            cv2.putText(
+                feature_screen,
+                f"Disp: {displacement:.1f}/{VERTICAL_DISPLACEMENT_THRESHOLD:.1f}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 50), 2
+            )
+            y_offset += 40
+
+            # 2) Count how many of the last N velocities exceed your threshold
+            # OLD: You never visualized velocity_history contents
+            lh = list(shot_detector.velocity_history_left)
+            rh = list(shot_detector.velocity_history_right)
+            cnt_l = sum(1 for v in lh if v > VELOCITY_THRESHOLD)
+            cnt_r = sum(1 for v in rh if v > VELOCITY_THRESHOLD)
+            buf_len = len(lh)  # same as CONSECUTIVE_FRAMES once full
+
+            cv2.putText(
+                feature_screen,
+                f"Vhist L:{cnt_l}/{buf_len} R:{cnt_r}/{buf_len}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (50, 200, 200), 2
+            )
+            y_offset += 40
+
+            # 3) Display current stability probability
+            # OLD: You didn’t show shot_detector.ball_stability_prob
+            stability = shot_detector.ball_stability_prob
+
+            cv2.putText(
+                feature_screen,
+                f"Stability: {stability:.2f}/1.00",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 50, 200), 2
+            )
+            y_offset += 40
+
+            if (shot_detector.state == ShotState.READY_TO_DETECT_SHOT):
+                post_stability = shot_detector.post_ball_stability_prob
+                cv2.putText(
+                    feature_screen,
+                    f"Post - Stability: {post_stability:.2f}/1.00",
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 50, 200), 2
+                )
+                y_offset += 40
+
+            cv2.putText(
+                feature_screen,
+                f"InvFrames: {shot_detector.consecutive_invisible_frames}/{MAX_BALL_INVISIBLE_FRAMES}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100, 100, 255), 2
+            )
+            y_offset += 40
+
+            if shot_detector.stability_frame is not None:
+                cv2.putText(
+                    feature_screen,
+                    f"Stab@Frame: {shot_detector.stability_frame}",
+                    (10, y_offset),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (100,200,100), 2
+                )
+                y_offset += 40
+
+            # --- Display the ball_disappeared_during_shot variable ---
+            cv2.putText(feature_screen, f"Ball Disappeared During Shot: {shot_detector.ball_disappeared_during_shot}", (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
+            y_offset += 40
+            
             if shot_detector.shots:
                 last_valid_shot = None
                 for shot in reversed(shot_detector.shots):
@@ -682,16 +837,20 @@ def main():
                 else:
                     last_shot_make_status = "No valid shots detected."
                     shot_id_text = "Last Shot ID: N/A"
-            else:
-                last_shot_make_status = "No Shots Detected Yet"
-                shot_id_text = "Last Shot ID: N/A"
-            last_shot_make_status_text = f"Last Shot Make Status: {last_shot_make_status}"
-            cv2.putText(feature_screen, last_shot_make_status_text, (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            y_offset += 40
-            cv2.putText(feature_screen, shot_id_text, (10, y_offset),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            y_offset += 40
+
+
+            # OLD: no visual cue at shot start
+            if (shot_detector.state == ShotState.SHOT_IN_PROGRESS and
+                shot_detector.current_shot and
+                shot_detector.current_shot['start_frame'] == frame_count):
+
+                cv2.putText(
+                    original_frame,
+                    "→ SHOT START ←",
+                    (50, 50),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 0, 255), 3
+                )
+            # --- END: highlight shot start on original_frame ---
 
             if config.DEV_MODE in [0, 1]:
                 resized_detection_display = cv2.resize(original_frame, (config.TARGET_WIDTH // 2, config.TARGET_HEIGHT // 2))
@@ -709,6 +868,16 @@ def main():
                     break
 
         logger.info("FINISHED EXITING OUT OF WHILE LOOP.")
+        
+        logger.info("Finished processing video frames.")
+        # Final update for main.py stage
+        job_ref.update({
+            "main_py_progress": 1.0,
+            "main_py_status": "completed",
+            "updated_at": firestore.SERVER_TIMESTAMP
+        })
+        logger.info("main_py stage marked as completed in Firestore.")
+
         cap.release()
         if config.DEV_MODE in [0, 1]:
             cv2.destroyAllWindows()
@@ -718,37 +887,92 @@ def main():
         df = pd.DataFrame(all_data)
         df.replace("N/A", np.nan, inplace=True)
         df.fillna(0, inplace=True)
-        df['make'] = np.nan
-        output_csv_filename = os.path.splitext(os.path.basename(input_video_source))[0] + "_entire_dataset.csv"
+
+        output_csv_filename = (
+            os.path.splitext(os.path.basename(input_video_source))[0]
+            + f"_entire_dataset_{job_id}.csv"
+        )
+
         if 'shot_id' in df.columns:
+            # Ensure shot_id is integer
             df['shot_id'] = pd.to_numeric(df['shot_id'], errors='coerce').astype('Int64')
+
+            # Build shot_make_map using the post‐shot gesture window
+            shots = sorted(shot_detector.shots, key=lambda s: s['shot_id'])
+            video_end_time = total_frames / fps
+
             shot_make_map = {}
-            for shot in shot_detector.shots:
-                s_id = shot.get('shot_id', None)
-                make_val = shot.get('make', None)
-                if s_id is not None and not pd.isna(s_id):
-                    shot_make_map[s_id] = make_val
-            for s_id, make in shot_make_map.items():
-                logger.debug(f"Shot ID {s_id}: Make={make}")
-            df['make'] = df['shot_id'].map(shot_make_map)
-            df['make'] = df['make'].map({True: 1, False: 0})
-            logger.debug(f"DataFrame after mapping 'make':\n{df[['shot_id', 'make']].head()}")
+            for idx, shot in enumerate(shots):
+                s_id = shot.get('shot_id')
+                start_window = shot.get('end_time', 0.0)
+                if idx + 1 < len(shots):
+                    end_window = shots[idx+1].get('start_time', start_window)
+                else:
+                    end_window = video_end_time
+
+                # Pick gestures that occur after this shot ends and before the next one starts
+                evs = [
+                    e for e in gesture_events
+                    if start_window <= e.get('timestamp', -1) <= end_window
+                ]
+
+                # Assign make/miss
+                if any(e.get('gesture') == 'thumbsUp'   for e in evs):
+                    make_flag = True
+                elif any(e.get('gesture') == 'thumbsDown' for e in evs):
+                    make_flag = False
+                else:
+                    make_flag = False
+
+                shot_make_map[s_id] = make_flag
+                logger.debug(f"Shot ID {s_id}: window [{start_window:.2f},{end_window:.2f}] → make={make_flag}")
+
+            logger.info(f"🔑 Final shot_make_map: {shot_make_map}")
+
+            # Map into DataFrame and convert booleans to 1/0
+            df['make'] = (
+                df['shot_id']
+                .map(shot_make_map)          # True/False or NaN
+                .map({True: 1, False: 0})    # 1=make, 0=miss
+                .fillna(0)                   # any unmatched shot_id → 0
+                .astype(int)
+            )
+            logger.debug(f"DataFrame after mapping 'make':\n{df[['shot_id','make']].head()}")
         else:
-            logger.warning("'shot_id' column not found in the dataframe. 'make' column will not be assigned.")
+            logger.warning("'shot_id' column not found; 'make' column will not be assigned.")
+
+
+        logger.info(
+            "📝 make flags by shot_id:\n" +
+            df[['shot_id','make']]
+            .drop_duplicates()
+            .sort_values('shot_id')
+            .to_string(index=False)
+        )
 
         output_csv_path = os.path.join(DATASETS_DIR, output_csv_filename)
         try:
             df.to_csv(output_csv_path, index=False)
-            logger.info(f"Complete dataset successfully saved to {output_csv_path}")
+            logger.info(f"Complete dataset saved to {output_csv_path}")
         except Exception as e:
-            logger.error(f"Error saving complete dataset to {output_csv_path}: {e}")
+            logger.error(f"Error saving complete dataset: {e}")
+
+        logger.info(f"Publishing message to Pub/Sub with job_id: {job_id} and dataset_path: {output_csv_path}")
+        message_payload = json.dumps({
+            "job_id": job_id,
+            "dataset_path": output_csv_path
+        }).encode('utf-8')
+        publisher = pubsub_v1.PublisherClient()
+        topic_path = publisher.topic_path('basketballformai', 'dataset-created')
+        future = publisher.publish(topic_path, message_payload)
+        future.result()
+
 
     pose.close()
-    if shot_detector.detect_hands and hand_detector:
-        hand_detector.close()
     if config.DEV_MODE in [0, 1]:
         cv2.destroyAllWindows()
-    logger.info("\nAll videos have been processed and datasets have been created. Now Exiting the Program!")
+    logger.info("\nAll videos have been processed and datasets have been created. Now sending message to pub/sub to activate data_processing.py and Exiting the Program!")
+    
     sys.exit(0)
 
 if __name__ == "__main__":

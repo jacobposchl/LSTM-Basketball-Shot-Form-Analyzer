@@ -88,6 +88,6 @@ This project is currently under active development. Licensing details will be pr
 ## 🙋‍♂️ Author
 
 Jacob Poschl  
-[LinkedIn](https://www.linkedin.com/in/jposchl) • [GitHub](https://github.com/jposchl)
+[LinkedIn](www.linkedin.com/in/jacobposchl) • [GitHub]((https://github.com/jacobposchl))
 
 ---

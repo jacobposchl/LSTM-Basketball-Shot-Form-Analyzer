@@ -1,0 +1,19 @@
+# Dockerfile.data
+FROM python:3.10-slim
+
+# Install build tools (for any pandas/numpy binary dependencies)
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# 1) Copy and install only the deps for data_processing.py
+COPY requirements-data-processing.txt .
+RUN pip install --no-cache-dir -r requirements-data-processing.txt
+
+# 2) Copy your script
+COPY data_processing.py .
+
+# 3) By default, run data_processing.py
+ENTRYPOINT ["python", "data_processing.py"]

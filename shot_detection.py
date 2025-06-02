@@ -97,28 +97,69 @@ class ShotDetector:
         self.consecutive_invisible_frames = 0
         self.last_ball_velocity = None
 
-    def update(self, left_wrist_vel, right_wrist_vel, left_wrist_abs_pos, right_wrist_abs_pos,
+    def update(self, left_wrist_vel, right_wrist_vel,
+               left_wrist_abs_pos, right_wrist_abs_pos,
                ball_pos, fps, frame_count, ball_velocity=None):
-        
-        # Update ball velocity
+        """
+        Update the shot detector state with new per-frame data.
+        """
+        # 1) Ball velocity & visibility
         self.last_ball_velocity = ball_velocity
-        
-        # Update ball visibility status
         previous_ball_visible = self.ball_visible
         self.ball_visible = ball_pos is not None
-        
+
+        # 2) Track consecutive frames without a YOLO detection (needed by stability logic)
+        if not self.ball_visible:
+            self.consecutive_invisible_frames += 1
+            self.frames_without_ball += 1
+        else:
+            self.consecutive_invisible_frames = 0
+            self.frames_without_ball = 0
+            self.last_ball_visible_frame = frame_count
+
+        # 3) Determine dominant wrist position
+        if DOMINANT_HAND == "RIGHT":
+            dom_wrist_pos = right_wrist_abs_pos
+        else:
+            dom_wrist_pos = left_wrist_abs_pos
+
+        # 4) Compute inter-wrist distance
+        if left_wrist_abs_pos is not None and right_wrist_abs_pos is not None:
+            self.wrist_distance = self.calculate_distance(
+                left_wrist_abs_pos, right_wrist_abs_pos
+            )
+        else:
+            self.wrist_distance = None
+
+        # 5) Compute wrist-to-ball distance
+        self.distance = self.calculate_distance(dom_wrist_pos, ball_pos)
+
+        # 6) Update closeness booleans
+        if self.distance is not None:
+            self.is_ball_close = self.distance <= BALL_WRIST_DISTANCE_THRESHOLD
+        else:
+            self.is_ball_close = False
+
+        if self.wrist_distance is not None:
+            self.are_wrists_close = (
+                self.wrist_distance <= WRIST_CLOSE_DISTANCE_THRESHOLD
+            )
+        else:
+            self.are_wrists_close = False
+
+        # 7) Handle WAITING_FOR_STABILITY: instability & stability probability
         if self.state == ShotState.WAITING_FOR_STABILITY:
-        # 1) track instability → reset only if sustained
+            # Track sustained wobble
             if self.ball_stability_prob < STABILITY_THRESHOLD:
                 self.unstable_frames += 1
             else:
                 self.unstable_frames = 0
 
             if self.unstable_frames >= MAX_UNSTABLE_FRAMES:
-                # too much wobble before a shot ever came → start over
+                # Too much jitter → reset
                 self.reset_shot_state()
             else:
-                # 2) update the probability of being stable
+                # Update stability probability now that metrics are fresh
                 self.update_ball_stability_prob(
                     left_wrist_vel, right_wrist_vel,
                     self.is_ball_close, ball_pos,
@@ -126,85 +167,64 @@ class ShotDetector:
                     self.wrist_distance, self.are_wrists_close
                 )
 
-        # Track consecutive frames with ball invisible
-        if not self.ball_visible:
-            self.consecutive_invisible_frames += 1
-            self.frames_without_ball += 1
-        else:
-            self.consecutive_invisible_frames = 0
-            self.last_ball_visible_frame = frame_count
-            self.frames_without_ball = 0
-        
-        # Determine dominant wrist position based on configuration
-        if DOMINANT_HAND == "RIGHT":
-            dom_wrist_pos = right_wrist_abs_pos
-        else:
-            dom_wrist_pos = left_wrist_abs_pos 
 
-        # Calculate distance between wrists if both are present
-        if left_wrist_abs_pos is not None and right_wrist_abs_pos is not None:
-            self.wrist_distance = self.calculate_distance(left_wrist_abs_pos, right_wrist_abs_pos)
-        else:
-            self.wrist_distance = None
-
-        # Calculate distance between dominant wrist and ball
-        self.distance = self.calculate_distance(dom_wrist_pos, ball_pos)
-        
-        # Determine if ball is close to wrist
-        if self.distance is not None:
-            self.is_ball_close = self.distance <= BALL_WRIST_DISTANCE_THRESHOLD
-        else:
-            self.is_ball_close = False
-
-        # Determine if wrists are close based on threshold
-        if self.wrist_distance is not None:
-            self.are_wrists_close = self.wrist_distance <= WRIST_CLOSE_DISTANCE_THRESHOLD
-        else:
-            self.are_wrists_close = False
-
-        
-        # Detect hands only in specific states
-        if self.state in [ShotState.COOLDOWN, ShotState.WAITING_FOR_STABILITY]:
-            self.detect_hands = True
-        else:
-            self.detect_hands = False
-
-        # Track if ball disappears during shot with release detection
-        if self.state == ShotState.SHOT_IN_PROGRESS and previous_ball_visible and not self.ball_visible:
-            # Check if the ball was likely released (away from wrist) when it disappeared
-            if self.distance is not None and self.distance > self.MIN_RELEASE_DISTANCE:
-                # Ball was already moving away from wrist when it disappeared
-                self.ball_released_and_disappeared = True
-                self.logger.debug(f"Ball released and disappeared at frame {frame_count}, distance: {self.distance:.2f}")
-            elif ball_velocity is not None and ball_velocity > self.MIN_BALL_VELOCITY_FOR_RELEASE:
-                # Ball had significant velocity when it disappeared
-                self.ball_released_and_disappeared = True
-                self.logger.debug(f"Ball with high velocity ({ball_velocity:.2f}) disappeared at frame {frame_count}")
-            else:
-                # Just a momentary detection issue while ball is still controlled
-                self.ball_disappeared_during_shot = True
-                self.logger.debug(f"Ball momentarily disappeared during shot at frame {frame_count}")
-
-        # Handle different states of the state machine
-        if self.state == ShotState.WAITING_FOR_STABILITY:
-            self.logger.debug(f"ball stable prob: {self.ball_stability_prob} at frame {frame_count}")
+            # Transition once we have enough stable frames
             if self.ball_stability_prob >= STABILITY_THRESHOLD:
                 self.stable_frames += 1
                 self.waiting_unstable_frames = 0
             else:
                 self.waiting_unstable_frames += 1
-                if (self.waiting_unstable_frames >= MAX_WAITING_UNSTABLE_FRAMES):
+                if self.waiting_unstable_frames >= MAX_WAITING_UNSTABLE_FRAMES:
                     self.stable_frames = 0
-                    self.waiiting_unstable_frames = 0
-            
+                    self.waiting_unstable_frames = 0
+
             if self.stable_frames >= STABLE_FRAMES_REQUIRED:
+                # Arm the detector
                 self.baseline_wrist_y = dom_wrist_pos[1]
                 self.stability_frame = frame_count
                 self.state = ShotState.READY_TO_DETECT_SHOT
                 self.velocity_history_left.clear()
                 self.velocity_history_right.clear()
-                self.ball_stability_prob = 0  # Reset after transition
-                self.logger.debug(f"Transition to READY_TO_DETECT_SHOT at frame {frame_count}")
+                self.ball_stability_prob = 0.0
+                self.logger.debug(
+                    f"Armed detector at frame {frame_count}, "
+                    f"baseline_y={self.baseline_wrist_y:.1f}" 
+                )
+
+        # Reset per-shot flags as needed
+        if self.state in [ShotState.COOLDOWN, ShotState.WAITING_FOR_STABILITY]:
+            self.detect_hands = True
+        else:
+            self.detect_hands = False
+
+        # Track disappearance during an in-progress shot
+        if (
+            self.state == ShotState.SHOT_IN_PROGRESS
+            and previous_ball_visible
+            and not self.ball_visible
+        ):
+            # Release-based disappearance
+            if self.distance is not None and self.distance > DISTANCE_THRESHOLD and self.consecutive_invisible_frames >= 6:
+                self.ball_released_and_disappeared = True
+                
+                self.logger.debug(
+                    f"Ball released & disappeared at {frame_count}, "
+                    f"dist={self.distance:.1f}" 
+                )
+            elif (
+                ball_velocity is not None
+                and ball_velocity > self.MIN_BALL_VELOCITY_FOR_RELEASE
+            ):
+                self.ball_released_and_disappeared = True
+                self.logger.debug(
+                    f"High-vel ball disappeared at {frame_count}, "
+                    f"vel={ball_velocity:.1f}" 
+                )
+            else:
+                self.ball_disappeared_during_shot = True
+                self.logger.debug(
+                    f"Momentary disappearance at {frame_count}" 
+                )
 
         elif self.state == ShotState.READY_TO_DETECT_SHOT:
 
@@ -318,7 +338,7 @@ class ShotDetector:
                     self.logger.debug(f"Shot {self.shot_num} completed at frame {frame_count} (ball released and disappeared)")
             
             # Alternative: Ball disappeared, but was moving away from wrist with high velocity
-            elif self.consecutive_invisible_frames >= 5 and shot_frames >= self.MIN_SHOT_FRAMES and shot_duration <= TIME_THRESHOLD:
+            elif self.ball_was_released and self.consecutive_invisible_frames >= 10 and shot_frames >= self.MIN_SHOT_FRAMES and shot_duration <= TIME_THRESHOLD:
                 # If ball has been invisible for several frames and the last known velocity was high
                 if self.last_ball_velocity is not None and self.last_ball_velocity > self.MIN_BALL_VELOCITY_FOR_RELEASE:
                     self.current_shot['end_frame'] = frame_count

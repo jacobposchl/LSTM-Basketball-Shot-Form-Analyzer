@@ -92,9 +92,16 @@ def compute_sequence_info(df):
                 end_indices.append(len(shot_df) - 1)
         for start_idx, end_idx in zip(start_indices, end_indices):
             start_frame = shot_df.loc[start_idx, 'frame']
-            end_frame = shot_df.loc[end_idx, 'frame']
-            shot_id_length = end_frame - start_frame
-            sequence_info.append((shot_id, start_frame, end_frame, shot_id_length))
+            end_frame   = shot_df.loc[end_idx,   'frame']
+            raw_length  = end_frame - start_frame
+
+            # extend the start by 1.5× the raw length
+            extension   = int(raw_length * 1.5)
+            new_start   = max(0, start_frame - extension)
+
+            # record the extended window
+            extended_length = end_frame - new_start
+            sequence_info.append((shot_id, new_start, end_frame, extended_length))
     return sequence_info
 
 def compute_max_length(sequence_info):
@@ -198,27 +205,6 @@ def split_dataset(data_df):
         f"test {test_df['shot_id'].nunique()} shots, {len(test_df)} rows"
     )
     return train_df, val_df, test_df
-
-def normalize_data(train_df, validation_df, test_df):
-    """Normalize the data using StandardScaler."""
-    columns_to_exclude = ['frame', 'make', 'shot_id']
-    numeric_columns = train_df.select_dtypes(include=["float64", "int"]).columns.tolist()
-    columns_to_scale = [col for col in numeric_columns if col not in columns_to_exclude]
-    scaler = StandardScaler()
-    scaler.fit(train_df[columns_to_scale])
-    
-    train_df[columns_to_scale] = scaler.transform(train_df[columns_to_scale])
-    if not validation_df.empty:
-        validation_df[columns_to_scale] = scaler.transform(validation_df[columns_to_scale])
-    else:
-        logger.warning("Validation dataframe is empty; skipping scaling for validation.")
-    if not test_df.empty:
-        test_df[columns_to_scale] = scaler.transform(test_df[columns_to_scale])
-    else:
-        logger.warning("Test dataframe is empty; skipping scaling for test.")
-    
-    logger.info("Normalization completed after splitting the data.")
-    return train_df, validation_df, test_df
 
 def dataframe_to_tensor(df, feature_columns, seq_len):
     """Convert sequences to fixed-length tensors with pad/truncate."""
@@ -369,14 +355,9 @@ def main():
                 logger.info(f"Uploaded shot {sid} → gs://{bucket_name}/{blob_path}")
         # ──────────────────────────────────────────────
 
-        # -------------------------------
-        # Stage 5: Split and Normalize Data
-        # -------------------------------
         train_df, validation_df, test_df = split_dataset(data_df)
-        train_df, validation_df, test_df = normalize_data(train_df, validation_df, test_df)
         
         update_job_progress(job_ref, 0.9, "saving_data")
-        logger.info("Normalization and splitting complete, preparing to save tensors.")
 
         columns_to_exclude = ['frame', 'make', 'shot_id']
         feature_columns = [col for col in train_df.columns if col not in columns_to_exclude]
@@ -409,6 +390,7 @@ def main():
 
         # Publish a Pub/Sub message to trigger model training
         message_payload = json.dumps({
+            "data_dir": "/home/jakeposchl/LSTM-Basketball-Shot-Form-Analyzer/Cleaned_Datasets",
             "job_filename": combined_filename,
             "job_id": job_id  # Include the job_id in the message
         }).encode('utf-8')

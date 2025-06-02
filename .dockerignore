@@ -1,0 +1,7 @@
+myenv
+myenv_backup
+__pycache__
+*.pyc
+.git
+Datasets
+core

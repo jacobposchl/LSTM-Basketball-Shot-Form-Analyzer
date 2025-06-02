@@ -3,6 +3,9 @@
 import warnings
 warnings.filterwarnings("ignore", category=FutureWarning)
 
+from mmpose_utils import find_cached, download_models_if_needed, visualize_skeleton
+
+import csv
 import cv2
 import math
 import numpy as np
@@ -17,12 +20,13 @@ import argparse
 from google.cloud import storage  # For GCP interactions
 from google.cloud import pubsub_v1 # For GCP Pub/Sub message sending
 from google.cloud import firestore
+from yolo_detection import YOLODetector
 from logging.handlers import RotatingFileHandler
 import config
 import uuid #for unique ID of dataset 
 import json
 
-
+from copy import deepcopy
 # Import configurations from config.py
 from config import (
     TARGET_WIDTH,
@@ -54,11 +58,15 @@ from config import (
     DEV_MODE,
     DEV_VIDEOS,
     DATASETS_DIR,
-    LOGS_DIR
+    LOGS_DIR,
+    DATA_MODE
 )
 
 from shot_detection import ShotDetector
 from project_utils import calculate_angle, map_to_original  # Ensure these functions are correctly implemented
+
+
+
 
 # Initialize logging
 os.makedirs(LOGS_DIR, exist_ok=True)
@@ -78,6 +86,16 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 logger.info("Logging initialized with rotation")
+
+yolo = YOLODetector(
+    weights_path=YOLO_WEIGHTS_PATH,
+    confidence_threshold=YOLO_CONFIDENCE_THRESHOLD,
+    repo_path=config.YOLOV5_DIR
+)
+
+import os, logging
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"      # silence TensorFlow INFO/WARN
+logging.getLogger("chardet").setLevel(logging.ERROR)
 
 def download_video_from_gcs(bucket_name: str, video_filename: str) -> str:
     """Downloads a video from Google Cloud Storage to local storage."""
@@ -195,25 +213,42 @@ def main():
     logger.info(f"Using job document ID: {job_id}")\
 
     job_doc = job_ref.get().to_dict()
-    # //ADD BACK ONCE DONE DEVELOPING
-    #if job_doc.get("main_py_status") == "completed":
-    #    logger.info("Job already processed, exiting.")
-    #   sys.exit(0)
-    # If a specific video is provided via CLI, download that file only.
+    
+    if not gesture_events:
+        # try both possible field‐names just in case
+        fb_events = (
+            job_doc.get("gesture_events")
+            or job_doc.get("raw_gesture_payload")
+            or []
+        )
+        logger.info(
+            f"🔄 No Pub/Sub payload – falling back to Firestore "
+            f"(gesture_events count={len(job_doc.get('gesture_events', []))}, "
+            f"raw_gesture_payload count={len(job_doc.get('raw_gesture_payload', []))})"
+        )
+        gesture_events = fb_events
+
+
     if args.video:
+        # 1) Google-cloud path?
         if args.video.startswith("gs://"):
-            bucket_name = args.video.split("/")[2]
-            video_filename = "/".join(args.video.split("/")[3:])
-            logger.info(f"Processing video from GCS path: {args.video}")
-            INPUT_VIDEOS = [download_video_from_gcs(bucket_name, video_filename)]
-            job_ref.update({
-                "video_upload_progress": 1.0,
-                "video_upload_status": "completed",
-                "updated_at": firestore.SERVER_TIMESTAMP
-            })
+            bucket_name   = args.video.split("/")[2]
+            video_object  = "/".join(args.video.split("/")[3:])
+            local_path    = os.path.join(config.GCP_DOWNLOAD_DIR,
+                                            os.path.basename(video_object))
+            # only download if missing
+            if not os.path.isfile(local_path):
+                local_path = download_video_from_gcs(bucket_name, video_object)
+            else:
+                logger.info(f"Found local copy at {local_path}, skipping GCS download.")
+            INPUT_VIDEOS = [local_path]
+            # 2) anything else → treat as an existing local file
         else:
-            logger.error("Provided video path must start with 'gs://'")
-            sys.exit(1)
+            if not os.path.isfile(args.video):
+                logger.error(f"Local video file not found: {args.video}")
+                sys.exit(1)
+            logger.info(f"Using local video {args.video}")
+            INPUT_VIDEOS = [args.video]
     else:
         # No CLI override; use DEV_MODE settings.
         # Clear the GCP_DOWNLOAD_DIR directory before starting.
@@ -267,45 +302,64 @@ def main():
 
     # Initialize detectors and models.
     shot_detector = ShotDetector()
+    device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
+    
 
-    import mediapipe as mp
-    mp_pose = mp.solutions.pose
-    pose = mp_pose.Pose(
-        static_image_mode=False,
-        model_complexity=1,
-        smooth_landmarks=True,
-        min_detection_confidence=config.MIN_POSE_DETECTION_CONFIDENCE,
-        min_tracking_confidence=config.MIN_POSE_TRACKING_CONFIDENCE
+    #download the mmpose model
+    download_models_if_needed()
+    
+    from mmengine.config import Config
+    from mmengine.registry import init_default_scope
+    from mmdet.apis import init_detector
+    init_default_scope('mmdet')
+    # 1) Person detector (Faster-RCNN)
+    det_cfg = Config.fromfile(find_cached(
+        ['faster-rcnn_r50_fpn_1x_coco*.py',
+        'faster_rcnn_r50_fpn_1x_coco*.py']
+    ))
+    det_cfg.default_scope = 'mmdet'
+    det_model = init_detector(det_cfg,
+                            find_cached(['faster-rcnn_r50_fpn_1x_coco*.pth',
+                                        'faster_rcnn_r50_fpn_1x_coco*.pth']),
+                            device=device)
+
+    # 2) Pose model (HRNet)
+    from mmpose.apis import init_model
+    pose_model = init_model(
+        find_cached(['td-hm_hrnet-w32_8xb64-210e_coco-256x192*.py']),
+        find_cached(['td-hm_hrnet-w32_8xb64-210e_coco-256x192*.pth']),
+        device=device
     )
-    mp_drawing = mp.solutions.drawing_utils
 
-    try:
-        model = torch.hub.load(
-            'ultralytics/yolov5',
-            'custom',
-            path=config.YOLO_WEIGHTS_PATH,
-            source='github'
-        )
-        model.eval()
-        logger.info("YOLOv5 model loaded successfully.")
-    except Exception as e:
-        logger.error(f"Error loading YOLOv5 model: {e}")
-        sys.exit(1)
 
-    class_names = model.names
+
+    # ─── Determine the basketball class ID from your YOLODetector ─────────────────
+    class_names = yolo.model.names
     SPORTS_BALL_CLASS_NAME = "basketball"
-    SPORTS_BALL_CLASS_ID = None
-    if isinstance(model.names, dict):
-        for class_id, class_name in model.names.items():
-            if str(class_name).lower() == SPORTS_BALL_CLASS_NAME.lower():
-                SPORTS_BALL_CLASS_ID = class_id
-                break
+    # Try both dict and list forms of names
+    if isinstance(class_names, dict):
+        # YOLOv5 sometimes gives names as {0: 'person', 1: 'bicycle', …}
+        SPORTS_BALL_CLASS_ID = next(
+            (cid for cid, cname in class_names.items()
+            if cname.lower() == SPORTS_BALL_CLASS_NAME.lower()),
+            None
+        )
+    elif isinstance(class_names, (list, tuple)):
+        # Or names could be a list like ['person', 'bicycle', …]
+        SPORTS_BALL_CLASS_ID = next(
+            (idx for idx, cname in enumerate(class_names)
+            if cname.lower() == SPORTS_BALL_CLASS_NAME.lower()),
+            None
+        )
     else:
-        logger.error(f"Error: model.names is of unexpected type: {type(model.names)}")
+        logger.error(f"Unexpected type for class_names: {type(class_names)}")
         sys.exit(1)
+
     if SPORTS_BALL_CLASS_ID is None:
-        logger.error(f"Error: Class '{SPORTS_BALL_CLASS_NAME}' not found in model classes.")
+        logger.error(f"Error: Class '{SPORTS_BALL_CLASS_NAME}' not found in YOLO classes.")
         sys.exit(1)
+
     logger.info(f"Ball Class ID: {SPORTS_BALL_CLASS_ID}")
 
     last_shot_id_displayed = None
@@ -323,20 +377,50 @@ def main():
         if not cap.isOpened():
             logger.error(f"Could not open video file: {input_video_source}")
             continue
+        
 
         fps = cap.get(cv2.CAP_PROP_FPS) or 60.0
-        original_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-        original_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        logger.info(f"📽 Video FPS detected: {fps:.2f} frames/sec")
+        dt = 1.0 / fps
+        raw_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        raw_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        # after rotation, width and height are swapped
+        original_width, original_height = raw_h, raw_w
         logger.info(f"Original Video Properties - FPS: {fps}, Width: {original_width}, Height: {original_height}")
         logger.info(f"Resizing all frames to {config.TARGET_WIDTH}x{config.TARGET_HEIGHT} for pose estimation.")
 
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        video_end_time = total_frames / fps
+        # ─── FIX: remove ~6s pre‐roll so gestures line up ───
+        pre_roll_seconds = 0            # roughly your observed 360-frame lead
+        gesture_frames = [
+            int(round((e['timestamp'] - pre_roll_seconds) * fps))
+            for e in gesture_events
+        ]
+        # clamp to video start
+        gesture_frames = [max(0, gf) for gf in gesture_frames]
+        logger.info(
+            f"🔢 Converted gesture timestamps to frames "
+            f"(minus {pre_roll_seconds}s): {gesture_frames}"
+        )
+        logger.info(f"🔢 Converted gesture timestamps to frames: {gesture_frames}")
 
+        if gesture_frames:
+            last_gesture_frame = max(gesture_frames)
+            # if the payload gesture is beyond the video end, extend
+            video_end_frame = max(total_frames, last_gesture_frame)
+        else:
+            video_end_frame = total_frames
+        
         prev_positions = {}
         prev_velocities = {}
         all_data = []
         frame_count = 0
         frames_with_landmarks = 0
+
+        # ─── for angle‐based derivatives ───
+        prev_angles  = {tuple(t): np.nan for t in ANGLE_JOINTS}
+        prev_ang_vel = {tuple(t): np.nan for t in ANGLE_JOINTS}
 
         shot_detector.reset_shot_state()
         shot_num = 0
@@ -353,9 +437,7 @@ def main():
         prev_ball_frame = 0
 
         if config.DEV_MODE in [0, 1]:
-            cv2.namedWindow("Detection with Orientation Vectors", cv2.WINDOW_NORMAL)
             cv2.namedWindow("Feature Visualization", cv2.WINDOW_NORMAL)
-            cv2.resizeWindow("Detection with Orientation Vectors", 600, 800)
             cv2.resizeWindow("Feature Visualization", 600, 800)
         else:
             logger.info("DEV_MODE is set to 2 or 3: Skipping visualization windows.")
@@ -367,8 +449,15 @@ def main():
             if not ret:
                 logger.info("End of video file reached.")
                 break
+            frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+            h, w = frame.shape[:2]
+            original_width, original_height = w, h
             frame_count += 1
             original_frame = frame.copy()
+             # ← ADD THESE TWO LINES IMMEDIATELY
+            yolo_seen = False
+            sports_ball_positions = []
+
 
             # Resize frame to target resolution with aspect ratio preserved.
             aspect_ratio = original_width / original_height
@@ -387,117 +476,168 @@ def main():
             color = [0, 0, 0]
             frame_padded = cv2.copyMakeBorder(frame_resized, top_pad, bottom_pad, left_pad, right_pad,
                                               cv2.BORDER_CONSTANT, value=color)
-            rgb_frame = cv2.cvtColor(frame_padded, cv2.COLOR_BGR2RGB)
+            
+            init_default_scope('mmdet')
+            from mmdet.apis import inference_detector
+            from mmpose.apis import inference_topdown
 
-            # Pose estimation and YOLO detection.
-            results_pose = pose.process(rgb_frame)
-            try:
-                yolo_results = model(original_frame)
-            except Exception as e:
-                yolo_results = None
-                logger.error(f"YOLO detection failed on frame {frame_count}: {e}")
+            # 1) detect people
+            dets = inference_detector(det_model, frame_padded)
+            bboxes = dets.pred_instances.bboxes.cpu().numpy()
+            scores = dets.pred_instances.scores.cpu().numpy()
+            persons = [b for b, s in zip(bboxes, scores) if s > 0.5]
 
-            filtered_detections = []
-            if yolo_results and hasattr(yolo_results, 'xyxy') and len(yolo_results.xyxy) > 0:
-                for det in yolo_results.xyxy[0]:
-                    x1, y1, x2, y2, conf, cls_id = det
-                    cls_id = int(cls_id)
-                    conf = float(conf)
-                    if cls_id == SPORTS_BALL_CLASS_ID and conf >= YOLO_CONFIDENCE_THRESHOLD:
-                        filtered_detections.append(det)
-                        if config.DEV_MODE in [0, 1]:
-                            cv2.rectangle(original_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2)
-                            label_text = f"Ball: {conf:.2f}"
-                            cv2.putText(original_frame, label_text, (int(x1), int(y1) - 10),
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # 2) estimate keypoints
+            if persons:
+                bboxes_np = np.array(persons)
+                pose_results = inference_topdown(
+                    pose_model,
+                    frame_padded,
+                    bboxes_np,
+                    bbox_format='xyxy'
+                )
+            else:
+                pose_results = []
+    
+            # ─── Use your YOLODetector wrapper ─────────────────────────
+            # This replaces both the try/except + manual unpacking above.
+
+            # 1) Run YOLO inference (returns list of dicts)
+            detections = yolo.run_inference(original_frame)
+            # detections[i] looks like:
+            #   {
+            #     'bbox': [x1, y1, x2, y2],
+            #     'confidence': 0.87,
+            #     'class_id': 0,
+            #     'class_name': 'basketball'
+            #   }
+
+            # 2) Overlay boxes + labels directly
+            yolo.draw_detections(original_frame, detections)
+
+            # 3) If you still need the raw list of floats for later logic:
+            filtered_detections = [
+                (*det['bbox'], det['confidence'])
+                for det in detections
+                if det['class_id'] == SPORTS_BALL_CLASS_ID
+            ]
+
+
+            # ─── Choose the largest detection as the ball position ───────
             sports_ball_positions = []
             largest_ball = None
             largest_area = 0
-            for det in filtered_detections:
-                x1, y1, x2, y2, conf, cls_id = det.tolist()
+            for x1, y1, x2, y2, conf in filtered_detections:
                 area = (x2 - x1) * (y2 - y1)
                 if area > largest_area:
-                    largest_area = area
                     x_center = (x1 + x2) / 2
                     y_center = (y1 + y2) / 2
                     if 0 <= x_center <= original_width and 0 <= y_center <= original_height:
+                        largest_area = area
                         largest_ball = (x_center, y_center)
-            if largest_ball:
-                sports_ball_positions = [largest_ball]
-                valid_ball_detected = True
-                prev_ball_pos = largest_ball           # <— store last-known
-                prev_ball_frame = frame_count
-            elif 'prev_ball_pos' in locals() and frame_count - prev_ball_frame <= MAX_BALL_INVISIBLE_FRAMES:
-                sports_ball_positions = [prev_ball_pos]
-                valid_ball_detected = True
-            else:
-                sports_ball_positions = []
-                valid_ball_detected = False
-
+                if largest_ball:
+                    sports_ball_positions = [largest_ball]
+                    yolo_seen = True
+                    prev_ball_pos  = largest_ball
+                    prev_ball_frame = frame_count
+                elif 'prev_ball_pos' in locals() and frame_count - prev_ball_frame <= MAX_BALL_INVISIBLE_FRAMES:
+                    sports_ball_positions = [prev_ball_pos]
+                    yolo_seen = False       # we’re just “hallucinating” last pos
+                else:
+                    sports_ball_positions = []
+                    yolo_seen = False
+            # ─── reset pose‐centering variables ─────────────────────────
             skeleton_center_x = None
             skeleton_center_y = None
             normalized_hip_center_y = None
 
 
 
-            if results_pose and results_pose.pose_landmarks:
-                landmarks = results_pose.pose_landmarks.landmark
-                left_hip = landmarks[joint_map["LEFT_HIP"]]
-                right_hip = landmarks[joint_map["RIGHT_HIP"]]
-                if left_hip.visibility > 0.5 and right_hip.visibility > 0.5:
-                    skeleton_center_padded_x = ((left_hip.x + right_hip.x) / 2) * config.TARGET_WIDTH
-                    skeleton_center_padded_y = ((left_hip.y + right_hip.y) / 2) * config.TARGET_HEIGHT
-                    skeleton_center_original_x, skeleton_center_original_y = map_to_original(
-                        skeleton_center_padded_x, skeleton_center_padded_y,
-                        original_width=int(original_frame.shape[1]),
-                        original_height=int(original_frame.shape[0]),
-                        new_width=new_width,
-                        new_height=new_height,
-                        left_pad=left_pad,
-                        top_pad=top_pad
+
+            skeleton_center_x = skeleton_center_y = None
+            if pose_results:
+                inst     = pose_results[0].pred_instances
+                kpts     = inst.keypoints[0]           # shape (17, 2)
+                scores_k = inst.keypoint_scores[0]     # shape (17,)
+                Lh, Rh   = joint_map["LEFT_HIP"], joint_map["RIGHT_HIP"]
+                if scores_k[Lh] > 0.3 and scores_k[Rh] > 0.3:
+                    # average the two hip coordinates
+                    xh = (kpts[Lh, 0] + kpts[Rh, 0]) / 2
+                    yh = (kpts[Lh, 1] + kpts[Rh, 1]) / 2
+                    skeleton_center_x, skeleton_center_y = map_to_original(
+                        xh, yh,
+                        original_width, original_height,
+                        new_width, new_height,
+                        left_pad, top_pad
                     )
-                    skeleton_center_x = skeleton_center_original_x
-                    skeleton_center_y = skeleton_center_original_y
-                    frames_with_landmarks += 1
-                    normalized_hip_center_y = max(0.0, min(1.0, skeleton_center_y / original_height))
-                else:
-                    logger.warning(f"Frame {frame_count}: Hips not sufficiently visible.")
-            else:
-                logger.warning(f"Frame {frame_count}: No pose landmarks detected.")
 
             joint_data = {}
-            if skeleton_center_x is not None and skeleton_center_y is not None and results_pose.pose_landmarks:
+            
+            if skeleton_center_x is not None and skeleton_center_y is not None and pose_results:
+                # grab the first person’s keypoints & scores
+                inst      = pose_results[0].pred_instances
+                kpts      = inst.keypoints[0]           # shape (17, 2): [ [x,y], … ]
+                scores_k  = inst.keypoint_scores[0]     # shape (17,)
+
+                # only include joints with confidence ≥ threshold
+                CONF_THR = 0.3
+
                 for joint_name, joint_idx in joint_map.items():
-                    j_lm = landmarks[joint_idx]
-                    x_padded = j_lm.x * config.TARGET_WIDTH
-                    y_padded = j_lm.y * config.TARGET_HEIGHT
+                    if scores_k[joint_idx] < CONF_THR:
+                        # skip low‐confidence joints
+                        continue
+
+                    # padded‐frame coordinates
+                    x_padded, y_padded = kpts[joint_idx]
+
+                    # map back to original frame
                     x_original, y_original = map_to_original(
                         x_padded, y_padded,
                         original_width, original_height,
                         new_width, new_height,
                         left_pad, top_pad
                     )
+
+                    # position relative to hip-center
                     relative_x = x_original - skeleton_center_x
                     relative_y = y_original - skeleton_center_y
                     current_pos = (relative_x, relative_y)
-                    if joint_name in prev_positions and prev_positions[joint_name] is not None:
+
+                    # compute instantaneous (raw) velocity
+                    if prev_positions.get(joint_name) is not None:
                         dx = relative_x - prev_positions[joint_name][0]
                         dy = relative_y - prev_positions[joint_name][1]
-                        raw_velocity = round(math.sqrt(dx**2 + dy**2) * fps, 2)
+                        raw_velocity = round(math.hypot(dx, dy) * fps, 2)
                     else:
                         raw_velocity = None
-                    if raw_velocity is not None and joint_name in prev_velocities and prev_velocities[joint_name] is not None:
+
+                    # compute instantaneous (raw) acceleration
+                    if raw_velocity is not None and prev_velocities.get(joint_name) is not None:
                         dvel = raw_velocity - prev_velocities[joint_name]
                         raw_acc = round(dvel * fps, 2)
                     else:
                         raw_acc = None
-                    joint_vel_history[joint_name].append(raw_velocity if raw_velocity is not None else 0)
-                    joint_acc_history[joint_name].append(raw_acc if raw_acc is not None else 0)
+
+                    # update history buffers (zero‐fill if None)
+                    joint_vel_history[joint_name].append(raw_velocity or 0)
+                    joint_acc_history[joint_name].append(raw_acc or 0)
+
+                    # smooth by simple moving average
                     smoothed_velocity = np.mean(joint_vel_history[joint_name])
-                    smoothed_acc = np.mean(joint_acc_history[joint_name])
-                    joint_data[joint_name] = {"pos": current_pos, "vel": round(smoothed_velocity, 2), "acc": round(smoothed_acc, 2)}
-                    prev_positions[joint_name] = current_pos
+                    smoothed_acc      = np.mean(joint_acc_history[joint_name])
+
+                    # store the final feature
+                    joint_data[joint_name] = {
+                        "pos": current_pos,
+                        "vel": round(smoothed_velocity, 2),
+                        "acc": round(smoothed_acc, 2)
+                    }
+                    frames_with_landmarks += 1
+                    # update for next frame
+                    prev_positions[joint_name]  = current_pos
                     prev_velocities[joint_name] = raw_velocity
+
+                    
 
             # --- Compute y-direction velocities for visualization ---
             if "LEFT_WRIST" in joint_data:
@@ -520,7 +660,7 @@ def main():
             else:
                 right_wrist_velocity_y = 0.0
 
-            if valid_ball_detected and skeleton_center_y is not None:
+            if yolo_seen and skeleton_center_y is not None and sports_ball_positions:
                 current_ball_y = sports_ball_positions[0][1] - skeleton_center_y
                 if prev_ball_y is not None:
                     ball_velocity_y = abs(current_ball_y - prev_ball_y) * fps
@@ -545,8 +685,9 @@ def main():
             # ─── LOWER-BODY: Hip‐Center Y ──────────────────────────
             # WHAT: Raw & normalized vertical position of hip midpoint.
             # WHY: Reflects overall body rise (leg extension) during shot.
-            features_row["hip_center_y"]      = round(skeleton_center_y, 2) if skeleton_center_y is not None else np.nan
-            features_row["hip_center_y_norm"] = round(normalized_hip_center_y, 3) if normalized_hip_center_y is not None else np.nan
+            if config.DATA_MODE == 1:
+                features_row["hip_center_y"]      = round(skeleton_center_y, 2) if skeleton_center_y is not None else np.nan
+                features_row["hip_center_y_norm"] = round(normalized_hip_center_y, 3) if normalized_hip_center_y is not None else np.nan
             # ───────────────────────────────────────────────────────
 
 
@@ -557,9 +698,10 @@ def main():
                     right_wrist_vel=joint_data["RIGHT_WRIST"]["vel"],
                     left_wrist_abs_pos=joint_data["LEFT_WRIST"]["pos"],
                     right_wrist_abs_pos=joint_data["RIGHT_WRIST"]["pos"],
-                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None,
+                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None and yolo_seen else None,
                     fps=fps,
-                    frame_count=frame_count
+                    frame_count=frame_count,
+                    ball_velocity=ball_velocity_y
                 )
             elif "LEFT_WRIST" in joint_data:
                 shot_detector.update(
@@ -567,9 +709,10 @@ def main():
                     right_wrist_vel=None,
                     left_wrist_abs_pos=joint_data["LEFT_WRIST"]["pos"],
                     right_wrist_abs_pos=None,
-                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None,
+                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None and yolo_seen else None,
                     fps=fps,
-                    frame_count=frame_count
+                    frame_count=frame_count,
+                    ball_velocity=ball_velocity_y
                 )
             elif "RIGHT_WRIST" in joint_data:
                 shot_detector.update(
@@ -577,12 +720,23 @@ def main():
                     right_wrist_vel=joint_data["RIGHT_WRIST"]["vel"],
                     left_wrist_abs_pos=None,
                     right_wrist_abs_pos=joint_data["RIGHT_WRIST"]["pos"],
-                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None else None,
+                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None and yolo_seen else None,
                     fps=fps,
-                    frame_count=frame_count
+                    frame_count=frame_count,
+                    ball_velocity=ball_velocity_y
                 )
             else:
-                shot_detector.reset_shot_state()
+                # Keep the shot state alive even if wrists drop out briefly
+                shot_detector.update(
+                    left_wrist_vel= joint_data.get("LEFT_WRIST",{}).get("vel"),
+                    right_wrist_vel=joint_data.get("RIGHT_WRIST",{}).get("vel"),
+                    left_wrist_abs_pos=joint_data.get("LEFT_WRIST",{}).get("pos"),
+                    right_wrist_abs_pos=joint_data.get("RIGHT_WRIST",{}).get("pos"),
+                    ball_pos=(sports_ball_positions[0][0] - skeleton_center_x, sports_ball_positions[0][1] - skeleton_center_y) if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None and yolo_seen else None,
+                    fps=fps,
+                    frame_count=frame_count,
+                    ball_velocity=ball_velocity_y
+                )
 
             # ─── LOWER-BODY: Stance Width ─────────────────────────
             # WHAT: Horizontal distance between left & right ankle (pixels).
@@ -597,32 +751,62 @@ def main():
 
 
 
+            if config.DATA_MODE == 1:
+                for left_joint, right_joint in PAIRED_JOINTS + [("LEFT_HIP","RIGHT_HIP"),
+                                                                ("LEFT_KNEE","RIGHT_KNEE"),
+                                                                ("LEFT_ANKLE","RIGHT_ANKLE")]:
+                    features_row[f"{left_joint}_vel"] = joint_data[left_joint]["vel"] if left_joint in joint_data else np.nan
+                    features_row[f"{right_joint}_vel"] = joint_data[right_joint]["vel"] if right_joint in joint_data else np.nan
+                    features_row[f"{left_joint}_acc"] = joint_data[left_joint]["acc"] if left_joint in joint_data else np.nan
+                    features_row[f"{right_joint}_acc"] = joint_data[right_joint]["acc"] if right_joint in joint_data else np.nan
 
-            for left_joint, right_joint in PAIRED_JOINTS + [("LEFT_HIP","RIGHT_HIP"),
-                                                            ("LEFT_KNEE","RIGHT_KNEE"),
-                                                            ("LEFT_ANKLE","RIGHT_ANKLE")]:
-                features_row[f"{left_joint}_vel"] = joint_data[left_joint]["vel"] if left_joint in joint_data else np.nan
-                features_row[f"{right_joint}_vel"] = joint_data[right_joint]["vel"] if right_joint in joint_data else np.nan
-                features_row[f"{left_joint}_acc"] = joint_data[left_joint]["acc"] if left_joint in joint_data else np.nan
-                features_row[f"{right_joint}_acc"] = joint_data[right_joint]["acc"] if right_joint in joint_data else np.nan
+                for joint_name in joint_map.keys():
+                    pos = joint_data[joint_name]["pos"] if joint_name in joint_data else (np.nan, np.nan)
+                    features_row[f"{joint_name}_pos_x"] = round(pos[0], 2) if pos[0] is not None else np.nan
+                    features_row[f"{joint_name}_pos_y"] = round(pos[1], 2) if pos[1] is not None else np.nan
 
-            for joint_name in joint_map.keys():
-                pos = joint_data[joint_name]["pos"] if joint_name in joint_data else (np.nan, np.nan)
-                features_row[f"{joint_name}_pos_x"] = round(pos[0], 2) if pos[0] is not None else np.nan
-                features_row[f"{joint_name}_pos_y"] = round(pos[1], 2) if pos[1] is not None else np.nan
-
-            for triplet in ANGLE_JOINTS:
-                joint_a, joint_b, joint_c = triplet
-                if (joint_a in joint_data and joint_b in joint_data and joint_c in joint_data and
-                    not any(np.isnan(joint_data[j]["pos"][0]) or np.isnan(joint_data[j]["pos"][1]) for j in [joint_a, joint_b, joint_c])):
-                    angle = calculate_angle(
-                        joint_data[joint_a]["pos"],
-                        joint_data[joint_b]["pos"],
-                        joint_data[joint_c]["pos"]
-                    )
-                    features_row[f"{joint_b}_{joint_a}_{joint_c}_angle"] = angle
+            # ─── compute angles, angular velocities & accelerations ───
+            angles_dict = {}
+            for joint_a, joint_b, joint_c in ANGLE_JOINTS:
+                key = (joint_a, joint_b, joint_c)
+                base = f"{joint_b}_{joint_a}_{joint_c}"
+                # current angle (or NaN)
+                if joint_a in joint_data and joint_b in joint_data and joint_c in joint_data:
+                    pa = joint_data[joint_a]["pos"]
+                    pb = joint_data[joint_b]["pos"]
+                    pc = joint_data[joint_c]["pos"]
+                    if not any(np.isnan(v) for v in (*pa, *pb, *pc)):
+                        angle = calculate_angle(pa, pb, pc)
+                    else:
+                        angle = np.nan
                 else:
-                    features_row[f"{joint_b}_{joint_a}_{joint_c}_angle"] = np.nan
+                    angle = np.nan
+                features_row[f"{base}_angle"] = angle
+                angles_dict[key] = angle
+
+            # now first‐ and second‐derivatives
+            for key, angle in angles_dict.items():
+                base = f"{key[1]}_{key[0]}_{key[2]}"
+                prev = prev_angles[key]
+                # velocity (deg/sec)
+                if np.isnan(prev) or np.isnan(angle):
+                    vel = np.nan
+                else:
+                    vel = (angle - prev) / dt
+                features_row[f"{base}_angle_vel"] = vel
+
+                # acceleration (deg/sec²)
+                prev_v = prev_ang_vel[key]
+                if np.isnan(prev_v) or np.isnan(vel):
+                    acc = np.nan
+                else:
+                    acc = (vel - prev_v) / dt
+                features_row[f"{base}_angle_acc"] = acc
+
+                # update history
+                prev_angles[key]  = angle
+                prev_ang_vel[key] = vel
+
 
             if shot_detector.current_shot:
                 features_row['is_shot'] = 1 if shot_detector.state == ShotState.SHOT_IN_PROGRESS else 0
@@ -656,8 +840,52 @@ def main():
                 })
                 logger.debug(f"Updated main_py_progress: {progress_fraction:.2f}")
 
-            if config.DEV_MODE in [0, 1] and results_pose.pose_landmarks:
-                draw_pose_on_original(original_frame, results_pose.pose_landmarks, map_to_original, new_width, new_height, left_pad, top_pad)
+
+            mapped_results = []
+            for pose_data in pose_results:
+                # copy so we don't clobber the model's own arrays
+                pose_copy  = deepcopy(pose_data)
+                inst = pose_copy.pred_instances
+
+                # pull out the original (n_instances, n_joints, 2) and scores (n_instances, n_joints)
+                kpts   = inst.keypoints       # torch.Tensor or np.ndarray
+                scores = inst.keypoint_scores # same
+
+                # convert to numpy if needed
+                kpts_np   = kpts.cpu().numpy()   if hasattr(kpts, "cpu") else kpts
+                scores_np = scores.cpu().numpy() if hasattr(scores, "cpu") else scores
+
+                n_inst, n_joints, _ = kpts_np.shape
+
+                # make an array of the same shape to hold remapped coords
+                remapped_kpts = np.zeros_like(kpts_np)
+
+                for i in range(n_inst):
+                    for j in range(n_joints):
+                        x_p, y_p = kpts_np[i, j]
+                        x_o, y_o = map_to_original(
+                            x_p, y_p,
+                            original_width, original_height,
+                            new_width, new_height,
+                            left_pad, top_pad
+                        )
+                        remapped_kpts[i, j] = [x_o, y_o]
+
+                # now reassign the *entire* keypoints and keep the scores untouched
+                inst.keypoints       = remapped_kpts
+                inst.keypoint_scores = scores_np
+
+                mapped_results.append(pose_copy)
+
+
+            if config.DEV_MODE in [0, 1]:
+                if (pose_results):
+                    overlay = visualize_skeleton(original_frame, mapped_results,
+                                            radius=4, thickness=2, kpt_score_thr=0.3)
+                else:
+                    overlay = original_frame
+
+                cv2.imshow("Skeleton Overlay", cv2.resize(overlay, (TARGET_WIDTH//2, TARGET_HEIGHT//2)))
 
             feature_screen = np.zeros((800, 600, 3), dtype=np.uint8)
             y_offset = 30
@@ -685,14 +913,24 @@ def main():
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
             if "LEFT_WRIST" in joint_data or "RIGHT_WRIST" in joint_data:
-                if sports_ball_positions and skeleton_center_x is not None and skeleton_center_y is not None:
-                    distance = shot_detector.distance
+                distance = shot_detector.distance    # may be None
+                if distance is not None:
+                    # we have a real number, format to two decimals
                     color_dist = (0, 255, 0) if shot_detector.is_ball_close else (0, 0, 255)
-                    cv2.putText(feature_screen, f"Ball-Wrist Dist: {distance:.2f}", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_dist, 2)
+                    cv2.putText(
+                        feature_screen,
+                        f"Ball-Wrist Dist: {distance:.2f}/{config.DISTANCE_THRESHOLD}",
+                        (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_dist, 2
+                    )
                 else:
-                    cv2.putText(feature_screen, "Ball-Wrist Dist: N/A", (10, y_offset),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+                    # distance failed to compute, show N/A
+                    cv2.putText(
+                        feature_screen,
+                        "Ball-Wrist Dist: N/A",
+                        (10, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2
+                    )
             y_offset += 40
 
             if (shot_detector.wrist_distance):
@@ -717,24 +955,25 @@ def main():
             )
             y_offset += 40
 
+
             # --- Display the new y-velocity features ---
             cv2.putText(feature_screen, f"Ball Vel (Y): {ball_velocity_y:.2f}", (10, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
             y_offset += 40
             
             # Show left‐wrist Y‐velocity against the “stable” threshold
-            cv2.putText(
-                feature_screen,
-                f"LVelY: {left_wrist_velocity_y:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
+            lvel = joint_data["LEFT_WRIST"]["vel"] if "LEFT_WRIST" in joint_data else 0.0
+            cv2.putText(feature_screen,
+            f"smoothed LVelY: {lvel:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
                 (10, y_offset),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
             )
             y_offset += 40
 
             # Show right‐wrist Y‐velocity against the “stable” threshold
-            cv2.putText(
-                feature_screen,
-                f"RVelY: {right_wrist_velocity_y:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
+            rvel = joint_data["RIGHT_WRIST"]["vel"] if "RIGHT_WRIST" in joint_data else 0.0
+            cv2.putText(feature_screen,
+                f"smoothed RVelY: {rvel:.1f}/{STABLE_VELOCITY_THRESHOLD:.1f}",
                 (10, y_offset),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2
             )
@@ -776,6 +1015,20 @@ def main():
             # OLD: You didn’t show shot_detector.ball_stability_prob
             stability = shot_detector.ball_stability_prob
 
+            cv2.putText(feature_screen,
+                f"StableFrames: {shot_detector.stable_frames}/{config.STABLE_FRAMES_REQUIRED}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,200,0), 2
+            )
+            y_offset += 30
+
+            cv2.putText(feature_screen,
+                f"UnstableFrames: {shot_detector.unstable_frames}/{config.MAX_UNSTABLE_FRAMES}",
+                (10, y_offset),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200,0,200), 2
+            )
+            y_offset += 30
+
             cv2.putText(
                 feature_screen,
                 f"Stability: {stability:.2f}/1.00",
@@ -815,7 +1068,23 @@ def main():
             cv2.putText(feature_screen, f"Ball Disappeared During Shot: {shot_detector.ball_disappeared_during_shot}", (10, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2)
             y_offset += 40
-            
+
+            s = "Gestures (frames): " + ", ".join(
+                str(int(g['timestamp'] * fps)) for g in gesture_events
+            )
+
+            # draw it in 60-char chunks, bottom-up
+            y = feature_screen.shape[0] - 30
+            for i in range(0, len(s), 60):
+                cv2.putText(feature_screen,
+                            s[i : i+60],
+                            (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX,
+                            0.5,
+                            (255, 255, 255),
+                            2)
+                y -= 15
+
             if shot_detector.shots:
                 last_valid_shot = None
                 for shot in reversed(shot_detector.shots):
@@ -854,7 +1123,6 @@ def main():
 
             if config.DEV_MODE in [0, 1]:
                 resized_detection_display = cv2.resize(original_frame, (config.TARGET_WIDTH // 2, config.TARGET_HEIGHT // 2))
-                cv2.imshow("Detection with Orientation Vectors", resized_detection_display)
                 cv2.imshow("Feature Visualization", feature_screen)
             else:
                 pass
@@ -862,10 +1130,70 @@ def main():
             if frame_count % 20 == 0:
                 logger.info(f"Processed {frame_count} frames, {frames_with_landmarks} with landmarks detected.")
             if config.DEV_MODE in [0, 1]:
-                key = cv2.waitKey(1) & 0xFF
+                key = cv2.waitKey(1) & 0xFF  # read a keypress
                 if key == ord('q'):
                     logger.info("Exiting processing loop as 'q' was pressed.")
                     break
+                elif key == ord('w'):
+                    # ─── REWIND 10 FRAMES ─────────────────────────────────────────────────
+                    rewind_frames = 50
+                    # compute new target frame index, clamped to zero
+                    new_frame_idx = max(frame_count - rewind_frames, 0)
+        
+                    # move the VideoCapture pointer
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, new_frame_idx)
+        
+                    # reset our “time” counters so the loop picks up at new_frame_idx
+                    frame_count = new_frame_idx
+        
+                    # clear shot‐detector’s internal state and its history buffers
+                    shot_detector.reset_shot_state()
+                    prev_positions.clear()
+                    prev_velocities.clear()
+        
+                    logger.info(
+                        f"Rewound {rewind_frames} frames → "
+                        f"now at frame {new_frame_idx}. "
+                        "Shot‐detector state and history cleared."
+                    )
+                    continue
+                elif key == ord('e'):
+                    # ─── JUMP 10 FRAMES ─────────────────────────────────────────────────
+                    jump_frames = 50
+                    # compute new target frame index, clamped to zero
+                    new_frame_idx = max(frame_count + jump_frames, 0)
+        
+                    # move the VideoCapture pointer
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, new_frame_idx)
+        
+                    # reset our “time” counters so the loop picks up at new_frame_idx
+                    frame_count = new_frame_idx
+        
+                    # clear shot‐detector’s internal state and its history buffers
+                    shot_detector.reset_shot_state()
+                    prev_positions.clear()
+                    prev_velocities.clear()
+        
+                    logger.info(
+                        f"Jumped {jump_frames} frames → "
+                        f"now at frame {new_frame_idx}. "
+                        "Shot‐detector state and history cleared."
+                    )
+                    continue
+                            
+                elif key == ord('r'):
+                    # jump back to the first frame
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    # reset all your per-video counters & accumulators
+                    frame_count = 0
+                    frames_with_landmarks = 0
+                    all_data.clear()                       # your list of dicts
+                    prev_positions.clear()                 # if you track these
+                    prev_velocities.clear()
+                    shot_detector.reset_shot_state()       # clear state machine
+                    logger.info("Restarting video from first frame due to 'r' press.")
+                    continue
+
 
         logger.info("FINISHED EXITING OUT OF WHILE LOOP.")
         
@@ -898,34 +1226,43 @@ def main():
             df['shot_id'] = pd.to_numeric(df['shot_id'], errors='coerce').astype('Int64')
 
             # Build shot_make_map using the post‐shot gesture window
-            shots = sorted(shot_detector.shots, key=lambda s: s['shot_id'])
-            video_end_time = total_frames / fps
+            shots = sorted([s for s in shot_detector.shots if not s.get('invalid', False)], key=lambda s: s['shot_id'])
 
             shot_make_map = {}
+
+            logger.info(f"📦 Loaded gesture_events ({len(gesture_events)}): {gesture_events}")
+            logger.info(
+            "🕒 Detected shot frames: " +
+            ", ".join(
+                f"ID{s['shot_id']}:[{s['start_frame']},{s.get('end_frame',s['start_frame'])}]"
+                for s in shots
+            )
+            )
+
             for idx, shot in enumerate(shots):
-                s_id = shot.get('shot_id')
-                start_window = shot.get('end_time', 0.0)
+                s_id = shot['shot_id']
+
+                # 1) grab the shot’s start‐ and end‐frames
+                start_f = shot['start_frame']
+                end_f   = shot.get('end_frame', start_f)
+
+                # 2) define next shot’s start‐frame (or video_end_frame)
                 if idx + 1 < len(shots):
-                    end_window = shots[idx+1].get('start_time', start_window)
+                    next_start_f = shots[idx+1]['start_frame']
                 else:
-                    end_window = video_end_time
+                    next_start_f = video_end_frame
 
-                # Pick gestures that occur after this shot ends and before the next one starts
-                evs = [
-                    e for e in gesture_events
-                    if start_window <= e.get('timestamp', -1) <= end_window
+                # 3) find any gesture_frames in [end_f, next_start_f]
+                hits = [
+                    gf for gf in gesture_frames
+                    if end_f <= gf <= next_start_f
                 ]
-
-                # Assign make/miss
-                if any(e.get('gesture') == 'thumbsUp'   for e in evs):
-                    make_flag = True
-                elif any(e.get('gesture') == 'thumbsDown' for e in evs):
-                    make_flag = False
-                else:
-                    make_flag = False
-
+                make_flag = len(hits) > 0
                 shot_make_map[s_id] = make_flag
-                logger.debug(f"Shot ID {s_id}: window [{start_window:.2f},{end_window:.2f}] → make={make_flag}")
+                logger.debug(
+                    f"Shot {s_id}: frames [{end_f},{next_start_f}] → "
+                    f"hits={hits} → make={make_flag}"
+                )
 
             logger.info(f"🔑 Final shot_make_map: {shot_make_map}")
 
@@ -968,7 +1305,6 @@ def main():
         future.result()
 
 
-    pose.close()
     if config.DEV_MODE in [0, 1]:
         cv2.destroyAllWindows()
     logger.info("\nAll videos have been processed and datasets have been created. Now sending message to pub/sub to activate data_processing.py and Exiting the Program!")

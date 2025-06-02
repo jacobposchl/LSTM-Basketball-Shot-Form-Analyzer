@@ -37,6 +37,7 @@ class YOLODetector:
                 path=self.weights_path,  # Path to custom weights
                 source='local'  # Specify that the source is local
             )
+            self.model.to(torch.device("cuda:0")) 
             self.model.eval()
             self.logger.info(f"Successfully loaded YOLOv5 model from {self.weights_path}")
         except Exception as e:
@@ -77,7 +78,6 @@ class YOLODetector:
                     'class_name': class_name
                 })
 
-            self.logger.debug(f"YOLOv5 Inference: {len(detections)} detections found.")
             return detections
 
         except Exception as e:

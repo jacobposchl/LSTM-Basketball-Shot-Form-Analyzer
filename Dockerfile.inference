@@ -1,0 +1,132 @@
+# Stage 1: Base environment with CUDA and system dependencies
+FROM nvidia/cuda:12.1.1-cudnn8-devel-ubuntu22.04 as base
+
+WORKDIR /workspace
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      git build-essential cmake \
+      python3 python3-pip python3-venv \
+      libx11-xcb1 libxcb1 libxcb-keysyms1 libxcb-image0 libxcb-shm0 libxcb-icccm4 \
+      libxcb-sync1 libxcb-xfixes0 libxcb-render-util0 libxcb-shape0 libxcb-xinerama0 \
+      libxkbcommon-x11-0 libqt5gui5 libgl1-mesa-glx libglib2.0-0 \
+      ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create virtual environment
+RUN python3 -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
+
+# Stage 2: Core numerical packages
+FROM base as numpy
+RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir \
+    numpy==1.26.4 \
+    opencv-python==4.7.0.72
+
+# Add this right after your numpy installation
+RUN pip install --no-cache-dir \
+    openxlab==0.1.2 \
+    filelock==3.14.0 \
+    packaging==24.0 \
+    pytz==2023.3 \
+    requests==2.28.2 \
+    rich==13.4.2 \
+    tqdm==4.65.0
+
+# Stage 3: PyTorch installation
+FROM numpy as pytorch
+# After installing PyTorch, pin critical packages
+RUN pip install --no-cache-dir \
+    torch==2.1.2+cu121 \
+    torchvision==0.16.2+cu121 \
+    torchaudio==2.1.2+cu121 \
+    --index-url https://download.pytorch.org/whl/cu121 && \
+    # Prevent upgrades of core packages
+    pip install --no-cache-dir \
+    filelock==3.14.0 \
+    packaging==24.0 \
+    pytz==2023.3 \
+    requests==2.28.2 \
+    rich==13.4.2 \
+    tqdm==4.65.0
+
+# Stage 4: OpenMMLab ecosystem (verified working)
+FROM pytorch as openmmlab
+
+# 1. Install build essentials and set compiler flags
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Force C++17 standard
+ENV CXXFLAGS="-std=c++17"
+ENV CFLAGS="-std=c++17"
+
+# 3. Install compatible versions
+RUN pip install --no-cache-dir openmim && \
+    mim install mmengine==0.10.7 && \
+    # Use MMCV 2.1.0 with exact wheel URL
+    pip install --no-cache-dir mmcv==2.1.0 -f https://download.openmmlab.com/mmcv/dist/cu121/torch2.1/index.html && \
+    # Upgrade MMDet to match MMCV 2.1.0
+    mim install mmdet==3.2.0 && \
+    mim download mmdet --config faster-rcnn_r50_fpn_1x_coco && \
+    # Upgrade MMPose to match
+    pip install --no-cache-dir mmpose==1.3.2
+
+# Verification
+RUN python -c "\
+import mmcv; print(f'MMCV: {mmcv.__version__}'); \
+import mmdet; print(f'MMDet: {mmdet.__version__}'); \
+import mmpose; print(f'MMPose: {mmpose.__version__}')"
+
+# Stage 5: YOLOv5 installation
+FROM openmmlab as yolov5
+RUN git config --global --add safe.directory /workspace/yolov5 && \
+    git clone --depth 1 --branch v7.0 https://github.com/ultralytics/yolov5.git /workspace/yolov5 && \
+    sed -i \
+    's/torch>=1.7.0/torch==2.1.2/g; \
+     s/torchvision>=0.8.1/torchvision==0.16.2/g; \
+     s/ultralytics/# ultralytics/g' \
+    /workspace/yolov5/requirements.txt && \
+    pip install -r /workspace/yolov5/requirements.txt
+
+# Stage 6: Application dependencies
+FROM yolov5 as dependencies
+COPY requirements-full.txt ./
+COPY constraints.txt .
+
+# 1. Remove all conflicting packages
+RUN sed -i \
+    '/^torch/d;/^torchvision/d;/^torchaudio/d;\
+    /^tensorflow/d;/^nvidia-.*/d;\
+    /^opencv-contrib-python/d;\
+    /^ultralytics/d;/^ultralytics-thop/d;\
+    /^triton/d;\
+    /^filelock/d;/^packaging/d;/^pytz/d;\
+    /^requests/d;/^rich/d;/^tqdm/d;\
+    /^urllib3/d' \
+    requirements-full.txt
+
+# 2. Install urllib3 first with compatible version
+RUN pip install --no-cache-dir urllib3==1.26.20
+
+# 3. Install remaining requirements
+RUN pip install --no-cache-dir -r requirements-full.txt -c constraints.txt
+
+# 4. Install pinned packages
+RUN pip install --no-cache-dir \
+    requests==2.28.2 \
+    filelock==3.14.0 \
+    packaging==24.0 \
+    pytz==2023.3 \
+    rich==13.4.2 \
+    tqdm==4.65.0
+# Final stage: Application code
+FROM dependencies as app
+COPY main.py yolo_detection.py config.py mmpose_utils.py project_utils.py pose_estimation.py shot_detection.py data_processing.py ./
+RUN python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}')" && \
+    python -c "import mmcv; print(f'MMCV: {mmcv.__version__}')" && \
+    python -c "import mmpose; print(f'MMPose: {mmpose.__version__}')"
+
+ENTRYPOINT ["python3", "main.py"]

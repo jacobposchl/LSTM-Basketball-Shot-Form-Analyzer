@@ -1,0 +1,8 @@
+# requirements-data-processing.txt
+numpy
+pandas
+scikit-learn
+matplotlib
+google-cloud-pubsub
+google-cloud-firestore
+google-cloud-storage

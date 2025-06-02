@@ -6,6 +6,7 @@ import matplotlib.pyplot as plt
 import argparse
 import json
 from tensorflow.keras import regularizers
+from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import confusion_matrix, classification_report
 from google.cloud import pubsub_v1
 from google.cloud import firestore
@@ -14,6 +15,8 @@ import os
 import io
 from google.cloud import storage
 from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import precision_score, recall_score, roc_auc_score
 import logging
 import sys
 
@@ -181,8 +184,33 @@ def main():
         })
         sys.exit(1)
 
+    n_train, seq_len, n_features = X_train.shape
+    scaler = StandardScaler()
+    #Flatten (n_train * seq_len, n_features)
+    X_train_flat = X_train.reshape(-1, n_features)
+    scaler.fit(X_train_flat)
+
+    def scale_split(X):
+        n, t, f = X.shape
+        X_flat = X.reshape(-1, f)
+        X_scaled_flat = scaler.transform(X_flat)
+        return X_scaled_flat.reshape(n, t, f)
+    
+    X_train = scale_split(X_train)
+    X_val = scale_split(X_val)
+    X_test = scale_split(X_test)
+
+    def flatten_for_rf(x):
+        n, t, f = x.shape
+        return x.reshape(n, t * f)
+    
+    X_train_rf = flatten_for_rf(X_train)
+    X_val_rf   = flatten_for_rf(X_val)
+    X_test_rf  = flatten_for_rf(X_test)
+
     print(f"Split sizes → train: {len(y_train)}, val: {len(y_val)}, test: {len(y_test)}")
-    print(f"Training on {X_train.shape[0]} sequences.")
+    print(f"Training on {X_train.shape[0]} sequences (each of length {X_train.shape[1]} with {X_train.shape[2]} features).")
+
 
     if X_train.shape[1] == 0 or X_train.shape[2] == 0:
         job_ref.update({
@@ -279,6 +307,33 @@ def main():
             "updated_at":      firestore.SERVER_TIMESTAMP
         })
         sys.exit(1)
+
+    # ─── Random Forest training & evaluation ───
+    rf = RandomForestClassifier(
+        n_estimators=100,
+        random_state=42
+    )
+
+    logger.info("Training Random Forest on %d samples", X_train_rf.shape[0])
+    rf.fit(X_train_rf, y_train)
+
+    # Predict & metrics
+    y_pred_rf       = rf.predict(X_test_rf)
+    y_pred_proba_rf = rf.predict_proba(X_test_rf)[:, 1]
+
+    cm_rf     = confusion_matrix(y_test, y_pred_rf)
+    report_rf = classification_report(y_test, y_pred_rf, digits=4)
+
+    acc_rf   = (y_pred_rf == y_test).mean()
+    prec_rf  = precision_score(y_test, y_pred_rf)
+    rec_rf   = recall_score(y_test, y_pred_rf)
+    auc_rf   = roc_auc_score(y_test, y_pred_proba_rf)
+
+    logger.info(
+        "RF results — acc: %.3f, prec: %.3f, rec: %.3f, auc: %.3f",
+        acc_rf, prec_rf, rec_rf, auc_rf
+    )
+    
     
     # Generate predictions, confusion matrix, and classification report.
     y_pred_probs = model.predict(X_test)
@@ -301,6 +356,33 @@ def main():
         "training_history": history.history
     }
 
+    rf_summary = {
+        "job_id":                 job_id,
+        "model_type":             "random_forest",
+        "test_accuracy":          acc_rf,
+        "precision":              prec_rf,
+        "recall":                 rec_rf,
+        "auc":                    auc_rf,
+        "confusion_matrix":       cm_rf.tolist(),
+        "classification_report":  report_rf,
+        "dataset_summary":        dataset_summary,
+        "train_split": {
+            "sequences": X_train.shape[0],
+            "makes":     int(y_train.sum()),
+            "misses":    int((y_train == 0).sum())
+        },
+        "val_split": {
+            "sequences": X_val.shape[0],
+            "makes":     int(y_val.sum()),
+            "misses":    int((y_val == 0).sum())
+        },
+        "test_split": {
+            "sequences": X_test.shape[0],
+            "makes":     int(y_test.sum()),
+            "misses":    int((y_test == 0).sum())
+        }
+    }
+
     summary.update({
         "dataset_summary":        dataset_summary,
         "train_split": {
@@ -321,9 +403,6 @@ def main():
     })
 
     
-    summary_json = json.dumps(summary)
-    print("JSON Summary:")
-    print(summary_json)
     
     # Publish the JSON summary to the Pub/Sub topic "lstm-results"
     try:
@@ -336,6 +415,17 @@ def main():
             "training_progress": 1.0,
             "updated_at":        firestore.SERVER_TIMESTAMP
         })
+        logger.info("RF summary payload: %s", json.dumps(rf_summary))
+        print("About to publish RF summary…")
+        topic_rf = publisher.topic_path('basketballformai', 'lstm-results')
+        future  = publisher.publish(
+            topic_rf,
+            json.dumps(rf_summary).encode('utf-8'),
+            filename=f"random_forest_{job_id}.json"   # this becomes a Pub/Sub attribute
+        )
+        future.result()  # block until it’s sent or throws
+        print("✅ RF summary published")
+        logger.info("✅ Published RF results as random_forest_%s.json", job_id)
     except Exception as e:
         logger.exception("Failed to publish results")
         job_ref.update({
@@ -344,6 +434,12 @@ def main():
             "updated_at":      firestore.SERVER_TIMESTAMP
         })
         sys.exit(1)
+
+    # Publish RF summary to the same Pub/Sub topic
+    topic_rf = publisher.topic_path('basketballformai', 'lstm-results')
+    summary_json = json.dumps(summary)
+    print("JSON Summary:")
+    print(summary_json)
 
 if __name__ == '__main__':
     main()
